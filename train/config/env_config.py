@@ -21,6 +21,7 @@ with open(_rl_config_path, "r") as f:
 N_ENVS = _rl_config["core_mult"] * multiprocessing.cpu_count()  # CPU core count * multiplier
 TOTAL_TIMESTEPS = _rl_config["total_timesteps"]
 N_STEPS = _rl_config["n_steps"]
+BATCH_SIZE = _rl_config["batch_size"]
 START_LEARNING_RATE = _rl_config["start_learning_rate"]
 END_LEARNING_RATE = _rl_config["end_learning_rate"]
 SEED = _rl_config["seed"]

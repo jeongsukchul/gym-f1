@@ -241,7 +241,7 @@ class TestMakeEvalEnv(unittest.TestCase):
         """Run make_eval_env with construction mocked out; return the per-env config dicts."""
         captured = []
 
-        def fake_make_env(seed, rank, config):
+        def fake_make_env(seed, rank, config, render_mode=None):
             captured.append(config)
             return lambda: MagicMock()
 

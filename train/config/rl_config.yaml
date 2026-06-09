@@ -8,6 +8,7 @@ core_mult: 2  # n_envs = core_mult * [# of CPU cores]
               # experimentally, the ideal number of envs was found to be 2 x [# of CPU cores]
 total_timesteps: 120000000  # 120 million timesteps
 n_steps: 4096  # Number of steps per rollout per environment
+batch_size: 4096  # PPO minibatch size; larger batches reduce optimizer overhead with many envs
 start_learning_rate: 0.0003 # initial learning rate
 end_learning_rate: 0.0001 # final learning rate, with linear decay
 act_func_neg_slope: 0.2  # actor, critic LeakyReLU negative slope

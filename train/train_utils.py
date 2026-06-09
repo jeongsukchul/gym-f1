@@ -250,6 +250,13 @@ def is_debug_render_enabled(config: dict) -> bool:
     return any(bool(config.get(key, False)) for key in EVAL_RENDER_CONFIG_KEYS)
 
 
+def is_display_available() -> bool:
+    """Return whether a local GUI display is available for human rendering."""
+    if os.name != "posix":
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
 def make_eval_base_config(config: dict, allow_debug_render: bool) -> dict:
     base = {**config, "record_obs_min_max": False}
     if not allow_debug_render:
@@ -402,7 +409,13 @@ def make_eval_env(seed: int, config: dict) -> DummyVecEnv:
     """
     base = make_eval_base_config(config, allow_debug_render=True)
 
-    render_mode = "human" if is_debug_render_enabled(base) else None
+    debug_render = is_debug_render_enabled(base)
+    if debug_render and not is_display_available():
+        print("Debug eval rendering requested, but no GUI display was found; using headless eval env.")
+        base.update({key: False for key in EVAL_RENDER_CONFIG_KEYS})
+        debug_render = False
+
+    render_mode = "human" if debug_render else None
 
     track_pool = config.get("track_pool")
     if track_pool is not None:

@@ -39,7 +39,9 @@ track_direction: "random"
 prevent_instability: true # enables integration instability checking with reset
 
 # Rendering/Debug settings
-test_debug_render: true
+# Keep callback/standalone evaluation headless by default. Use `--r` for a
+# single visual rollout on a machine with a display.
+test_debug_render: false
 train_debug_render: false
 
 # Callback config

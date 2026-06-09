@@ -25,6 +25,7 @@ from train.config.env_config import (
     ACTOR_LAYER_SIZE,
     ADDITIONAL_TIMESTEPS,
     BEST_MODEL,
+    BATCH_SIZE,
     CKPT_SAVE_FREQ,
     CRITIC_LAYER_SIZE,
     END_LEARNING_RATE,
@@ -192,6 +193,7 @@ def train(profile: TrainingProfile):
         policy="MlpPolicy",
         env=env,
         n_steps=N_STEPS,
+        batch_size=BATCH_SIZE,
         verbose=1,
         tensorboard_log=tensorboard_dir,
         device="auto",
@@ -373,6 +375,7 @@ def continue_training(profile: TrainingProfile, model_path: str, additional_time
     eval_env = make_eval_env(EVAL_SEED, profile.test_config)
 
     model = PPO.load(model_path, env=env, device="auto")
+    model.batch_size = BATCH_SIZE
 
     model.tensorboard_log = tensorboard_dir
 
@@ -499,6 +502,7 @@ def transfer_train(
     eval_env = make_eval_env(EVAL_SEED, profile.test_config)
 
     model = PPO.load(model_path, env=env, device="auto")
+    model.batch_size = BATCH_SIZE
     model.tensorboard_log = tensorboard_dir
 
     # Fresh LR schedule - must set both learning_rate (source of truth) and lr_schedule (cached callable used at each update)
