@@ -52,7 +52,20 @@ Install the gym environment from PyPI with:
 pip install gymkhana
 ```
 
-Alternatively, to use all features, or for development (training, controllers, analysis, etc.), clone the full repo and install dependencies using `poetry`:
+Alternatively, to use all features, or for development (training, controllers, analysis, etc.), clone the full repo and install dependencies using `conda`:
+
+```bash
+git clone --recurse-submodules https://github.com/TeoIlie/Gym-Khana.git
+cd Gym-Khana
+conda create -n gymkhana python=3.11 -y
+conda activate gymkhana
+python -m pip install -U pip
+python -m pip install -r requirements.txt
+```
+
+This installs Gym-Khana in editable mode and includes the development, training, and documentation dependencies.
+
+You can also install the same dependency groups using `poetry`:
 
 ```bash
 git clone --recurse-submodules https://github.com/TeoIlie/Gym-Khana.git
@@ -81,6 +94,8 @@ python3 controller_example.py
 ### Additional Dependencies
 
 MPC controllers require dependencies that cannot be installed via pip alone. For the reference MPC implementation see the ForzaETH [race_stack](https://github.com/ForzaETH/race_stack)
+
+Skip this section unless you plan to run the MPC examples/controllers (`examples/kmpc_race_example.py`, `examples/stmpc_race_example.py`, or `controller_type="stmpc"`).
 
 **acados** (build from source) — see the official [installation docs](https://docs.acados.org/installation/index.html) and [Python interface docs](https://docs.acados.org/python_interface/index.html):
 

@@ -23,12 +23,26 @@ Using pip (recommended)
    cd Gym-Khana
    pip install -e .
 
+Using conda
+-----------
+
+To install the full repository with development, training, and documentation dependencies:
+
+.. code:: bash
+
+   git clone --recurse-submodules https://github.com/TeoIlie/Gym-Khana.git
+   cd Gym-Khana
+   conda create -n gymkhana python=3.11 -y
+   conda activate gymkhana
+   python -m pip install -U pip
+   python -m pip install -r requirements.txt
+
 Using poetry
 ------------
 
 .. code:: bash
 
-   poetry install
+   poetry install --all-groups
    source $(poetry env info -p)/bin/activate  # or prefix commands with `poetry run`
 
 .. _additional-dependencies:

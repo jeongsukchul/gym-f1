@@ -14,6 +14,7 @@ from stable_baselines3.common.policies import BasePolicy
 from wandb.integration.sb3 import WandbCallback
 
 import wandb
+from train.evaluation import evaluate_policy, evaluation_result_to_wandb_metrics, format_evaluation_result
 from train.callbacks import (
     LogStdScheduleCallback,
     make_curriculum_callback,
@@ -55,6 +56,7 @@ from train.train_utils import (
     linear_schedule,
     log_best_eval_timestep,
     make_eval_env,
+    make_parallel_eval_env,
     make_output_dirs,
     make_subprocvecenv,
     print_header,
@@ -81,6 +83,75 @@ RL_YAML = "rl_config.yaml"
 TRANSFER_YAML = "transfer_config.yaml"
 DEPLOY_YAML = "deploy.yaml"
 OBS_MIN_MAX_YAML = "obs_min_max.yaml"
+
+
+def make_standalone_eval_config(profile: TrainingProfile) -> dict:
+    """Build config used only by --m e/--m d standalone evaluation."""
+    config = {**profile.test_config}
+
+    domain_randomization = profile.train_config.get("domain_randomization")
+    if domain_randomization:
+        config["domain_randomization"] = domain_randomization
+
+    evaluation_track_pool = config.get("evaluation_track_pool")
+    if evaluation_track_pool is not None:
+        if isinstance(evaluation_track_pool, str):
+            evaluation_track_pool = [evaluation_track_pool]
+        if not isinstance(evaluation_track_pool, list) or len(evaluation_track_pool) == 0:
+            raise ValueError("evaluation_track_pool must be a non-empty list or string")
+
+        config["track_pool"] = evaluation_track_pool
+        config["map"] = evaluation_track_pool[0]
+        if config.get("training_mode") == "recover":
+            config["recovery_map"] = evaluation_track_pool[0]
+
+    return config
+
+
+def run_final_training_evaluation(
+    profile: TrainingProfile,
+    model: PPO,
+    eval_envs: int = 256,
+    n_eval_episodes: int | None = None,
+):
+    print_header(profile.display_name + " Final Evaluation")
+
+    if n_eval_episodes is None:
+        n_eval_episodes = eval_envs
+    if n_eval_episodes < eval_envs:
+        raise ValueError(
+            f"n_eval_episodes ({n_eval_episodes}) must be >= eval_envs ({eval_envs}) "
+            "so every parallel final eval env can run at least one episode."
+        )
+
+    eval_config = make_standalone_eval_config(profile)
+    dr_sigmas = eval_config.get("domain_randomization") or {}
+    eval_track_pool = eval_config.get("track_pool")
+    print(f"Final eval domain randomization: {dr_sigmas if dr_sigmas else 'disabled'}")
+    print(f"Final eval track_pool: {eval_track_pool if eval_track_pool is not None else 'single map config'}")
+
+    eval_env = make_parallel_eval_env(EVAL_SEED, eval_config, eval_envs)
+    try:
+        evaluation_result = evaluate_policy(
+            model,
+            eval_env,
+            n_eval_episodes=n_eval_episodes,
+            deterministic=True,
+            render=False,
+            return_stats=True,
+            warn=True,
+        )
+    finally:
+        eval_env.close()
+
+    print(f"Final evaluation with {eval_envs} headless env(s)")
+    print(format_evaluation_result(evaluation_result))
+
+    metrics = evaluation_result_to_wandb_metrics(evaluation_result, n_envs=eval_envs)
+    metrics["global_step"] = model.num_timesteps
+    wandb.log(metrics, step=model.num_timesteps)
+    print(f"Logged {len(metrics)} final_eval metrics to wandb at step {model.num_timesteps}")
+    return evaluation_result
 
 
 def train(profile: TrainingProfile):
@@ -181,11 +252,18 @@ def train(profile: TrainingProfile):
     eval_env.close()
 
     log_best_eval_timestep(models_dir)
+    run_final_training_evaluation(profile, model)
 
     run.finish()
 
 
-def evaluate(profile: TrainingProfile, model_path: str = ""):
+def evaluate(
+    profile: TrainingProfile,
+    model_path: str = "",
+    render: bool = False,
+    eval_envs: int = 256,
+    n_eval_episodes: int | None = None,
+):
     print_header(profile.display_name + " Evaluation")
 
     proj_root, _ = get_output_dirs()
@@ -195,10 +273,42 @@ def evaluate(profile: TrainingProfile, model_path: str = ""):
 
     model = PPO.load(model_path, print_system_info=True, device="cpu")
     print(f"Loaded model from {model_path}")
+    eval_config = make_standalone_eval_config(profile)
+    dr_sigmas = eval_config.get("domain_randomization") or {}
+    eval_track_pool = eval_config.get("track_pool")
+    print(f"Standalone eval domain randomization: {dr_sigmas if dr_sigmas else 'disabled'}")
+    print(f"Standalone eval track_pool: {eval_track_pool if eval_track_pool is not None else 'single map config'}")
+
+    if not render:
+        if n_eval_episodes is None:
+            n_eval_episodes = eval_envs
+        if n_eval_episodes < eval_envs:
+            raise ValueError(
+                f"n_eval_episodes ({n_eval_episodes}) must be >= eval_envs ({eval_envs}) "
+                "so every parallel eval env can run at least one episode."
+            )
+
+        eval_env = make_parallel_eval_env(EVAL_SEED, eval_config, eval_envs)
+        try:
+            evaluation_result = evaluate_policy(
+                model,
+                eval_env,
+                n_eval_episodes=n_eval_episodes,
+                deterministic=True,
+                render=False,
+                return_stats=True,
+                warn=True,
+            )
+        finally:
+            eval_env.close()
+
+        print(f"Evaluated with {eval_envs} headless env(s)")
+        print(format_evaluation_result(evaluation_result))
+        return
 
     eval_env = gym.make(
         get_env_id(),
-        config=profile.test_config,
+        config=eval_config,
         render_mode="human",
     )
     np.random.seed()
@@ -521,7 +631,13 @@ def evaluate_onnx(profile: TrainingProfile, onnx_path: str):
     print(f"Total reward: {total_reward}")
 
 
-def download_and_evaluate(profile: TrainingProfile, run_id: str):
+def download_and_evaluate(
+    profile: TrainingProfile,
+    run_id: str,
+    render: bool = False,
+    eval_envs: int = 256,
+    n_eval_episodes: int | None = None,
+):
     """Download model from wandb and evaluate it."""
     print_header("Downloading and Evaluating Model from WandB")
 
@@ -537,7 +653,13 @@ def download_and_evaluate(profile: TrainingProfile, run_id: str):
         model_cache_path = download_model_from_wandb(run_id, download_dir, profile.model_prefix, profile.project_name)
         print(f"Model cached to {download_dir}")
 
-    evaluate(profile=profile, model_path=model_cache_path)
+    evaluate(
+        profile=profile,
+        model_path=model_cache_path,
+        render=render,
+        eval_envs=eval_envs,
+        n_eval_episodes=n_eval_episodes,
+    )
 
 
 def main(profile: TrainingProfile):
@@ -561,16 +683,48 @@ def main(profile: TrainingProfile):
         default="",
         help="Wandb run ID to download model from (required for mode 'd')",
     )
+    parser.add_argument(
+        "-r",
+        "--r",
+        "--render",
+        action="store_true",
+        dest="render",
+        help="Render mode for evaluation: use the old single-env visual rollout instead of headless batch eval",
+    )
+    parser.add_argument(
+        "--eval_envs",
+        type=int,
+        default=256,
+        help="Number of parallel headless envs for mode 'e'/'d' when not rendering",
+    )
+    parser.add_argument(
+        "--eval_episodes",
+        type=int,
+        default=None,
+        help="Number of headless evaluation episodes for mode 'e'/'d' (default: --eval_envs)",
+    )
     args = parser.parse_args()
 
     if args.m == "t":
         train(profile=profile)
     elif args.m == "e":
-        evaluate(profile=profile, model_path=args.path)
+        evaluate(
+            profile=profile,
+            model_path=args.path,
+            render=args.render,
+            eval_envs=args.eval_envs,
+            n_eval_episodes=args.eval_episodes,
+        )
     elif args.m == "d":
         if not args.run_id:
             parser.error("--run_id is required when using mode 'd' (download)")
-        download_and_evaluate(profile=profile, run_id=args.run_id)
+        download_and_evaluate(
+            profile=profile,
+            run_id=args.run_id,
+            render=args.render,
+            eval_envs=args.eval_envs,
+            n_eval_episodes=args.eval_episodes,
+        )
     elif args.m == "c":
         if not args.path:
             parser.error("--path is required when using mode 'c' (continue training)")

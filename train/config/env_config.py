@@ -54,6 +54,7 @@ PROJECT_NAME = _config["project_name"]
 RACE_TRAINING_MODE = _config["race_training_mode"]
 MAP = _config["map"]
 TRACK_POOL = _config["track_pool"]
+EVALUATION_TRACK_POOL = _config.get("evaluation_track_pool")
 TRACK_DIRECTION = _config["track_direction"]
 NUM_BEAMS = _config["num_beams"]  # training-only: minimal LiDAR beams to save compute
 SPARSE_WIDTH_OBS = _config["sparse_width_obs"]
@@ -122,6 +123,7 @@ def _drift_overrides():
         "training_mode": RACE_TRAINING_MODE,
         "map": MAP,
         "track_pool": TRACK_POOL,
+        "evaluation_track_pool": EVALUATION_TRACK_POOL,
         "track_direction": TRACK_DIRECTION,
     }
 

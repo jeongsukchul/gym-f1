@@ -13,7 +13,12 @@ import torch.nn as nn
 import yaml
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnv
+from stable_baselines3.common.vec_env import (
+    DummyVecEnv,
+    SubprocVecEnv,
+    VecEnv,
+    sync_envs_normalization,
+)
 
 import wandb
 from gymkhana.envs.gymkhana_env import GKEnv, print_obs_min_max_stats
@@ -233,18 +238,40 @@ def compute_global_track_bounds(track_pool: list[str], track_scale: float = 1.0)
     }
 
 
-def make_env(seed: int, rank: int, config: dict):
+EVAL_RENDER_CONFIG_KEYS = (
+    "render_lookahead_curvatures",
+    "debug_frenet_projection",
+    "render_track_lines",
+    "render_arc_length_annotations",
+)
+
+
+def is_debug_render_enabled(config: dict) -> bool:
+    return any(bool(config.get(key, False)) for key in EVAL_RENDER_CONFIG_KEYS)
+
+
+def make_eval_base_config(config: dict, allow_debug_render: bool) -> dict:
+    base = {**config, "record_obs_min_max": False}
+    if not allow_debug_render:
+        base.update({key: False for key in EVAL_RENDER_CONFIG_KEYS})
+    if base.get("track_direction") == "random":
+        base["track_direction"] = "normal"
+    return base
+
+
+def make_env(seed: int, rank: int, config: dict, render_mode: str | None = None):
     """
     Create a single F1TENTH gym environment, wrapped in Monitor.
     Args:
         rank: Unique ID for for seeding
+        render_mode: Optional Gymnasium render mode, e.g. "human".
     Returns:
         Callable that creates the environment
     """
 
     def _init():
         try:
-            env = gym.make(get_env_id(), config=config)
+            env = gym.make(get_env_id(), config=config, render_mode=render_mode)
             env = Monitor(env)
             env.reset(seed=seed + rank)  # Seed each env differently for diverse experiences
             return env
@@ -315,12 +342,12 @@ def get_ckpt_callback(models_dir: str, save_freq: int = CKPT_SAVE_FREQ) -> Check
         verbose=1,
     )
 
-
 def get_eval_callback(
     eval_env,
     models_dir: str,
     eval_freq: int = CKPT_SAVE_FREQ,
     n_eval_episodes: int = N_EVAL_EPISODES,
+    render: bool | None = None,
 ) -> EvalCallback:
     """
     Create evaluation callback for periodic model evaluation during training.
@@ -330,6 +357,7 @@ def get_eval_callback(
         models_dir: Base directory for model outputs
         eval_freq: Evaluation frequency in steps (default: CKPT_SAVE_FREQ)
         n_eval_episodes: Number of episodes per evaluation (default: 5)
+        render: Whether to render evaluation episodes. Defaults to matching eval_env render mode.
     """
     num_envs = getattr(eval_env, "num_envs", 1)
     if n_eval_episodes < num_envs:
@@ -337,6 +365,10 @@ def get_eval_callback(
             f"n_eval_episodes ({n_eval_episodes}) must be >= eval_env.num_envs ({num_envs}) "
             f"to evaluate every map at least once."
         )
+    if render is None:
+        render_modes = eval_env.get_attr("render_mode")
+        render = any(mode in ("human", "human_fast", "rgb_array") for mode in render_modes)
+
     return EvalCallback(
         eval_env=eval_env,
         best_model_save_path=f"{models_dir}/{BEST_MODEL}",
@@ -344,7 +376,7 @@ def get_eval_callback(
         eval_freq=eval_freq,
         n_eval_episodes=n_eval_episodes,
         deterministic=True,
-        render=False,
+        render=render,
         verbose=1,
     )
 
@@ -368,9 +400,9 @@ def make_eval_env(seed: int, config: dict) -> DummyVecEnv:
     Forces ``record_obs_min_max=False``; pins ``track_direction`` to ``"normal"`` only
     when it was ``"random"`` (eliminates per-episode direction noise).
     """
-    base = {**config, "record_obs_min_max": False}
-    if base.get("track_direction") == "random":
-        base["track_direction"] = "normal"
+    base = make_eval_base_config(config, allow_debug_render=True)
+
+    render_mode = "human" if is_debug_render_enabled(base) else None
 
     track_pool = config.get("track_pool")
     if track_pool is not None:
@@ -383,8 +415,53 @@ def make_eval_env(seed: int, config: dict) -> DummyVecEnv:
         env_configs = [base]
         label = "single env (no map override; recovery uses recovery_map)"
 
-    vec_env = DummyVecEnv([make_env(seed=seed, rank=i, config=c) for i, c in enumerate(env_configs)])
-    print(f"✅ Successfully created {len(env_configs)} eval env(s) as DummyVecEnv with seed {seed}: {label}")
+    vec_env = DummyVecEnv(
+        [make_env(seed=seed, rank=i, config=c, render_mode=render_mode) for i, c in enumerate(env_configs)]
+    )
+    render_label = render_mode or "headless"
+    print(
+        f"✅ Successfully created {len(env_configs)} eval env(s) as DummyVecEnv "
+        f"with seed {seed}, render_mode={render_label}: {label}"
+    )
+    return vec_env
+
+
+def make_parallel_eval_env(seed: int, config: dict, n_envs: int, use_subproc: bool = True) -> VecEnv:
+    """Build a headless vectorized env for large offline evaluation.
+
+    Unlike ``make_eval_env()``, this disables debug-render flags even if the test
+    config enables them, because this path is intended for high-throughput
+    non-rendered evaluation.
+    """
+    if n_envs <= 0:
+        raise ValueError(f"n_envs must be positive, got {n_envs}")
+
+    base = make_eval_base_config(config, allow_debug_render=False)
+    track_pool = base.get("track_pool")
+
+    if track_pool is not None:
+        if not isinstance(track_pool, list) or len(track_pool) == 0:
+            raise ValueError("track_pool must be a non-empty list")
+        _validate_track_names(track_pool)
+        env_configs = []
+        for i in range(n_envs):
+            map_name = track_pool[i % len(track_pool)]
+            env_configs.append({**base, "map": map_name})
+        distribution = Counter(track_pool[i % len(track_pool)] for i in range(n_envs))
+        label = f"track distribution {dict(distribution)}"
+    else:
+        env_configs = [base.copy() for _ in range(n_envs)]
+        label = "single env config (no map override; recovery uses recovery_map)"
+
+    env_fns = [make_env(seed=seed, rank=i, config=c, render_mode=None) for i, c in enumerate(env_configs)]
+    if use_subproc and n_envs > 1:
+        vec_env = SubprocVecEnv(env_fns)
+        vec_type = "SubprocVecEnv"
+    else:
+        vec_env = DummyVecEnv(env_fns)
+        vec_type = "DummyVecEnv"
+
+    print(f"✅ Successfully created {n_envs} headless eval env(s) as {vec_type} with seed {seed}: {label}")
     return vec_env
 
 

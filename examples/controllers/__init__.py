@@ -1,8 +1,6 @@
 """Controller abstraction layer for F1TENTH analysis scripts."""
 
 from .base import Controller
-from .learned_controller import LearnedController
-from .mpc.stmpc_controller import STMPCController
 from .steer_controller import (
     BETA_GAIN,
     FRENET_N_GAIN,
@@ -19,6 +17,26 @@ from .steer_controller import (
     StanleyController,
     get_config,
 )
+
+
+def _load_learned_controller():
+    from .learned_controller import LearnedController
+
+    return LearnedController
+
+
+def _load_stmpc_controller():
+    from .mpc.stmpc_controller import STMPCController
+
+    return STMPCController
+
+
+def __getattr__(name: str):
+    if name == "LearnedController":
+        return _load_learned_controller()
+    if name == "STMPCController":
+        return _load_stmpc_controller()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def create_controller(
@@ -52,6 +70,7 @@ def create_controller(
         case "learned":
             if model_path is None:
                 raise ValueError("model_path required for learned controller")
+            LearnedController = _load_learned_controller()
             return LearnedController(model_path=model_path, map=map)
 
         case "stable":
@@ -64,6 +83,7 @@ def create_controller(
             return StanleyController(target_speed=target_speed, map=map)
 
         case "stmpc":
+            STMPCController = _load_stmpc_controller()
             return STMPCController(ref_speed=target_speed, map=map)
 
         case _:

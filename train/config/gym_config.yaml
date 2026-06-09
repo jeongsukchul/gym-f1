@@ -25,6 +25,11 @@ track_pool:
 # For single-map training, set to null or comment out:
 # track_pool: null
 
+# Standalone evaluation (`--m e`/`--m d`) uses this pool instead of the
+# training-time track_pool above. Keep one entry for single-track eval.
+evaluation_track_pool:
+  - "Drift"
+
 # Observation
 record_obs_min_max: true
 sparse_width_obs: true
@@ -52,8 +57,11 @@ recovery_track_pool: null # train only on IMS
 # Domain randomization - multiplicative Gaussian noise from N(1, sigma) applied to selected params 
 # comment out to disable DR
 domain_randomization:
-  m: 0.05
-  I_z: 0.02
+  m: 0.05         # mass
+  I_z: 0.02       # yaw inertia
+  lf: 0.05        # CoG fore-distance; lr auto-tracks (wheelbase preserved)
+  s_max: 0.03     # max steering angle; s_min auto-mirrors
+  sv_max: 0.02    # max steering velocity; sv_min auto-mirrors
 
 # Curriculum learning - gradually expand recovery state ranges
 curriculum:

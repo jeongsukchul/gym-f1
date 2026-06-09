@@ -5,9 +5,13 @@ Usage:
     # Train a new model
     python train/ppo_recover.py --m t
 
-    # Evaluate a local model (uses latest wandb run if --path not specified)
+    # Evaluate a local model headlessly with many parallel envs (uses latest wandb run if --path not specified)
     python train/ppo_recover.py --m e
     python train/ppo_recover.py --m e --path /path/to/model.zip
+    python train/ppo_recover.py --m e --eval_envs 256 --eval_episodes 256
+
+    # Render one visual evaluation episode
+    python train/ppo_recover.py --m e --r --path /path/to/model.zip
 
     # Download model from wandb and evaluate (uses cache if already downloaded)
     python train/ppo_recover.py --m d --run_id <wandb_run_id>
