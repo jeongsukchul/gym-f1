@@ -77,7 +77,13 @@ optuna-dashboard = "^0.20.0"
 [tool.poetry.group.train.dependencies]
 wandb = "^0.17.0"
 stable-baselines3 = {extras = ["extra"], version = "^2.7.0"}
+jax = "^0.6.2"
+brax = "^0.9.4"
+flax = "^0.10.7"
+optax = "^0.2.8"
 omegaconf = "^2.3.0"
+mergedeep = "^1.3.4"
+matplotlib = "^3.8.2"
 tensorboard = "^2.20.0"
 lark = "^1.3.1"
 pydantic = "^2.12.5"
@@ -100,6 +106,7 @@ ignore = ["E203", "E501", "E402", "E721", "E741", "F601", "F841"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
+"gymkhana/jax_sampler_ppo/gmmvi/**/*.py" = ["E731", "F401", "I001", "W291", "W292", "W293"]
 
 [build-system]
 requires = ["poetry-core"]

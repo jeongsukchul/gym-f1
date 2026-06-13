@@ -57,10 +57,19 @@ MAP = _config["map"]
 TRACK_POOL = _config["track_pool"]
 EVALUATION_TRACK_POOL = _config.get("evaluation_track_pool")
 TRACK_DIRECTION = _config["track_direction"]
+TIMESTEP = _config["timestep"]
+MAX_EPISODE_STEPS = _config["max_episode_steps"]
+PROGRESS_GAIN = _config["progress_gain"]
+OUT_OF_BOUNDS_PENALTY = _config["out_of_bounds_penalty"]
+NEGATIVE_VEL_PENALTY = _config["negative_vel_penalty"]
 NUM_BEAMS = _config["num_beams"]  # training-only: minimal LiDAR beams to save compute
 SPARSE_WIDTH_OBS = _config["sparse_width_obs"]
+LOOKAHEAD_N_POINTS = _config["lookahead_n_points"]
+LOOKAHEAD_DS = _config["lookahead_ds"]
+NORMALIZE_OBS = _config["normalize_obs"]
 RECORD_OBS_MIN_MAX = _config["record_obs_min_max"]
 PREVENT_INSTABILITY = _config["prevent_instability"]
+DR_CLIP_K = _config["dr_clip_k"]
 
 # Vehicle parameters
 PARAMS = GKEnv.f1tenth_std_vehicle_params()
@@ -104,15 +113,24 @@ def _base_config(debug_render):
     """
     return drift_config(
         params=PARAMS,
+        timestep=TIMESTEP,
+        max_episode_steps=MAX_EPISODE_STEPS,
+        progress_gain=PROGRESS_GAIN,
+        out_of_bounds_penalty=OUT_OF_BOUNDS_PENALTY,
+        negative_vel_penalty=NEGATIVE_VEL_PENALTY,
         num_beams=NUM_BEAMS,
         # training-workflow-specific keys not in drift_config
         render_lookahead_curvatures=debug_render,
         debug_frenet_projection=debug_render,
         render_track_lines=debug_render,
         render_arc_length_annotations=debug_render,
+        lookahead_n_points=LOOKAHEAD_N_POINTS,
+        lookahead_ds=LOOKAHEAD_DS,
         sparse_width_obs=SPARSE_WIDTH_OBS,
+        normalize_obs=NORMALIZE_OBS,
         record_obs_min_max=RECORD_OBS_MIN_MAX,
         prevent_instability=PREVENT_INSTABILITY,
+        dr_clip_k=DR_CLIP_K,
     )
 
 

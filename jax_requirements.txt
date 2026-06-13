@@ -1,0 +1,26 @@
+# JAX-based learning stack for Gym-Khana.
+# This intentionally does not include Gymnasium, Stable-Baselines3, or mujoco_playground.
+#
+# For CPU-only installs, replace the first line with:
+#   jax==0.6.2
+jax[cuda12]==0.6.2
+brax==0.9.4
+flax==0.10.7
+optax==0.2.8
+chex==0.1.90
+
+# Shared F1TENTH/JAX env utilities
+numpy>=1.18
+scipy>=1.7.3
+PyYAML>=5.3.1
+omegaconf>=2.3.0,<3.0.0
+mergedeep>=1.3.4,<2.0.0
+matplotlib>=3.8.0
+pillow>=9.0.1
+
+# Logging and export
+wandb>=0.17.0,<0.18.0
+tensorboard>=2.20.0,<3.0.0
+onnx>=1.20.0
+onnxruntime>=1.12,<1.24
+torch>=2.0.0

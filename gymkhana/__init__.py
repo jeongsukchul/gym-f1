@@ -1,12 +1,18 @@
 __version__ = "1.2.0"
 
-import gymnasium as gym
+try:
+    import gymnasium as gym
+except ImportError:  # pragma: no cover - exercised only in Gymnasium-free installs
+    gym = None
 
-from .presets import drift_config
+if gym is not None:
+    from .presets import drift_config
 
-gym.register(
-    id="gymkhana-v0",
-    entry_point="gymkhana.envs:GKEnv",
-)
+    gym.register(
+        id="gymkhana-v0",
+        entry_point="gymkhana.envs:GKEnv",
+    )
 
-__all__ = ["drift_config"]
+    __all__ = ["drift_config"]
+else:
+    __all__ = []

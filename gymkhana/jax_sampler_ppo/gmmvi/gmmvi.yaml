@@ -1,0 +1,31 @@
+#config for target
+prior_mean: 0.
+prior_scale : 20.
+init_std :  20.
+dim: 2
+#general config
+initial_stepsize: 1.0 # component stepsize and weight step size
+initial_l2_regularizer: 1e-5
+use_self_normalized_importance_weights :  True
+temperature :  1.0
+#GMM config
+use_diagonal_convs :  False
+num_initial_components : 20
+# sample db config
+use_sample_database :  True
+max_database_size :  100000
+# sample selector config
+batch_size :  128 
+ratio_reused_samples_to_desired :  0.0
+#component stepsize config
+min_stepsize :  1e-4
+max_stepsize :  1.0
+stepsize_inc_factor :  1.1
+stepsize_dec_factor :  0.9
+#num component adaptation
+del_iters :  100
+add_iters :  30
+max_components :  20
+thresholds_for_add_heuristic :   [5000.0, 1000.0, 500.0, 200.0, 100.0, 50.0]
+min_weight_for_del_heuristic :  1e-06
+num_database_samples : 1000
