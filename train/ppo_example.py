@@ -1,9 +1,16 @@
 import os
+import sys
+from pathlib import Path
 
 import gymnasium as gym
 import numpy as np
 from stable_baselines3 import PPO
 from wandb.integration.sb3 import WandbCallback
+
+if __package__ in (None, ""):
+    repo_root = str(Path(__file__).resolve().parents[1])
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
 
 import wandb
 from train.config.env_config import PROJECT_NAME, SEED

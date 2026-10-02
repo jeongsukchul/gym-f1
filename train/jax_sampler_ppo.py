@@ -3,17 +3,25 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import math
 import multiprocessing
 import os
 import random
+import sys
 from pathlib import Path
+
+if __package__ in (None, ""):
+    repo_root = str(Path(__file__).resolve().parents[1])
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"  # Avoid OOM on limited-memory devices
 
 import jax
 import jax.numpy as jnp
 import yaml
+from train.config.rollout import get_rollout_length
 
 from gymkhana.jax_env import JaxRaceEnv
 from gymkhana.jax_sampler_ppo import (
@@ -21,7 +29,6 @@ from gymkhana.jax_sampler_ppo import (
     SamplerPPOConfig,
     SamplerPPOTrainer,
     evaluate_policy,
-    export_trainer_policy_to_onnx,
     make_domain_spec,
     record_policy_trajectory,
 )
@@ -43,14 +50,65 @@ def _metric_dict(metrics: dict) -> dict:
 def _wandb_run_name(gym_config: dict, rl_config: dict) -> str:
     jax_config = rl_config.get("jax_sampler_ppo", {})
     sampler = str(jax_config.get("sampler", "uniform"))
+    if not jax_config.get("domain_randomization", True):
+        sampler = "nominal"
     gmm_beta = jax_config.get("gmm_target_beta", "na")
+    use_ppo_lag = bool(jax_config.get("use_ppo_lag", False))
+    algorithm = "ppo_lag" if use_ppo_lag else "ppo"
     map_name = gym_config.get("map", "unknown_map")
     seed = rl_config.get("seed", "na")
     eval_dr = "evalDR" if jax_config.get("eval_domain_randomization", False) else "evalNominal"
-    return f"{map_name}_{sampler}_beta_{gmm_beta}_s_{seed}_{eval_dr}"
+    eval_horizon = int(jax_config.get("eval_episode_steps", 10000))
+    lag_label = (
+        f"_{jax_config.get('constraint_cost_type', 'edge')}cost"
+        f"_sb{jax_config.get('safety_bound', 0):g}"
+        f"_li{jax_config.get('initial_lambda_lagr', 0):g}"
+        f"_lr{jax_config.get('lagrangian_coef_rate', 0):g}"
+        f"_lu{jax_config.get('lagrangian_update_mode', 'per_step')}"
+        if use_ppo_lag
+        else ""
+    )
+    dr_profile = jax_config.get("domain_randomization_profile")
+    dr_label = f"_dr{dr_profile}" if dr_profile else ""
+    if sampler in {"reward_cost_gmmvi", "dual_gmmvi", "rc_gmmvi"}:
+        formulation = jax_config.get("gmm_formulation", "reward_cost")
+        sampler_label = (
+            f"{sampler}_{formulation}_rkl{jax_config.get('gmm_reward_kl_radius', 'na')}"
+            f"_cb{jax_config.get('safety_bound', 'na')}"
+            f"_cs{jax_config.get('gmm_cost_score_scale', 1):g}"
+            f"_ce{jax_config.get('gmm_cost_dual_ema_decay', jax_config.get('gmm_dual_ema_decay', 0.9))}"
+            f"_clr{jax_config.get('gmm_cost_dual_lr', 0.01):g}"
+            f"_cdu{jax_config.get('gmm_cost_dual_update', 'linear')}"
+            "_cdiradversarial"
+        )
+    elif sampler in {"gmmvi", "gmm"}:
+        sampler_label = f"{sampler}_beta_{gmm_beta}"
+    else:
+        sampler_label = sampler
+    return f"{map_name}_{algorithm}{lag_label}{dr_label}_{sampler_label}_s_{seed}_{eval_dr}_eh{eval_horizon}"
 
 
-def _init_wandb(gym_config: dict, rl_config: dict, *, disabled: bool = False) -> bool:
+def _hidden_layer_sizes_from_config(rl_config: dict, key: str, legacy_key: str) -> tuple[int, ...]:
+    value = rl_config.get(key, rl_config.get(legacy_key))
+    if value is None:
+        raise KeyError(f"Missing required RL config key '{key}'")
+    if isinstance(value, int):
+        return (int(value), int(value))
+    if not isinstance(value, (list, tuple)) or len(value) == 0:
+        raise ValueError(f"RL config key '{key}' must be a non-empty list of positive ints, got {value!r}")
+    layers = tuple(int(width) for width in value)
+    if any(width <= 0 for width in layers):
+        raise ValueError(f"RL config key '{key}' must contain only positive ints, got {value!r}")
+    return layers
+
+
+def _init_wandb(
+    gym_config: dict,
+    rl_config: dict,
+    *,
+    disabled: bool = False,
+    save_code: bool = False,
+) -> bool:
     if disabled:
         return False
     try:
@@ -62,7 +120,8 @@ def _init_wandb(gym_config: dict, rl_config: dict, *, disabled: bool = False) ->
                 project=gym_config.get("project_name", "f1tenth-jax-sampler-ppo"),
                 name=_wandb_run_name(gym_config, rl_config),
                 config={"rl_config": rl_config, "gym_config": gym_config},
-                save_code=True,
+                save_code=save_code,
+                settings={"disable_git": not save_code, "disable_code": not save_code},
             )
             started_here = True
         wandb.define_metric("global_step")
@@ -79,12 +138,42 @@ def _wandb_log(metrics: dict, env_steps: int) -> bool:
 
         if wandb.run is None:
             return False
-        payload = _metric_dict(metrics)
+        scalar_metrics = _metric_dict(metrics)
+        canonical = {
+            key: value
+            for key, value in scalar_metrics.items()
+            if key.startswith(("training/", "evaluation/"))
+        }
+        # Prefer a stage-first hierarchy so W&B panels do not mix training
+        # and evaluation series. Legacy-only callers still use the fallback.
+        payload = canonical or scalar_metrics
         payload["global_step"] = int(env_steps)
         wandb.log(payload, step=int(env_steps))
         return True
     except Exception:
         return False
+
+
+def _wandb_update_config(config_updates: dict) -> None:
+    try:
+        import wandb
+
+        if wandb.run is not None:
+            wandb.config.update(config_updates, allow_val_change=True)
+    except Exception:
+        pass
+
+
+def _wandb_run_id() -> str | None:
+    try:
+        import wandb
+
+        if wandb.run is None:
+            return None
+        run_id = getattr(wandb.run, "id", None)
+        return str(run_id) if run_id else None
+    except Exception:
+        return None
 
 
 def _load_yaml(path: Path) -> dict:
@@ -107,10 +196,39 @@ def _num_updates(total_timesteps: int, num_envs: int, unroll_length: int) -> int
 
 
 def _lr_transition_steps(rl_config: dict, jax_config: dict, num_envs: int) -> int:
-    rollout_size = int(num_envs) * int(rl_config["n_steps"])
-    num_rollouts = _num_updates(int(rl_config["total_timesteps"]), num_envs, int(rl_config["n_steps"]))
+    rollout_length = get_rollout_length(rl_config)
+    rollout_size = int(num_envs) * rollout_length
+    num_rollouts = _num_updates(int(rl_config["total_timesteps"]), num_envs, rollout_length)
     num_minibatches = max(1, rollout_size // int(rl_config["batch_size"]))
     return num_rollouts * int(jax_config["num_epochs"]) * num_minibatches
+
+
+def _run_output_label() -> str:
+    run_id = _wandb_run_id()
+    if run_id is not None:
+        return f"run_{run_id}"
+    return f"run_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+
+
+def _scoped_output_dir(base_dir: str | os.PathLike[str], *, sampler: str, seed: int, run_label: str) -> str:
+    base_path = Path(base_dir)
+    return str(base_path.parent / sampler / f"seed_{int(seed)}" / run_label / base_path.name)
+
+
+def _apply_scoped_output_dirs(
+    rl_config: dict,
+    run_label: str,
+    *,
+    scoped_keys: tuple[str, ...] = ("sampler_plot_dir", "eval_render_dir", "eval_video_dir"),
+) -> None:
+    jax_config = rl_config["jax_sampler_ppo"]
+    sampler = str(jax_config.get("sampler", "uniform"))
+    seed = int(rl_config["seed"])
+    for key in scoped_keys:
+        base_dir = jax_config.get(key)
+        if not base_dir:
+            continue
+        jax_config[key] = _scoped_output_dir(base_dir, sampler=sampler, seed=seed, run_label=run_label)
 
 
 def _build_trainer_config(rl_config: dict, num_envs: int) -> SamplerPPOConfig:
@@ -120,6 +238,7 @@ def _build_trainer_config(rl_config: dict, num_envs: int) -> SamplerPPOConfig:
     end_log_std = float(log_std_schedule["end"]) if log_std_schedule else None
     return SamplerPPOConfig(
         sampler=str(jax_config.get("sampler", "uniform")),
+        domain_randomization=bool(jax_config.get("domain_randomization", True)),
         num_eval_envs=int(jax_config.get("num_eval_envs", 0)),
         num_evals=int(jax_config.get("num_evals", 1)),
         sampler_plot_samples=int(jax_config.get("sampler_plot_samples", 4096)),
@@ -143,24 +262,71 @@ def _build_trainer_config(rl_config: dict, num_envs: int) -> SamplerPPOConfig:
         end_learning_rate=float(rl_config["end_learning_rate"]),
         learning_rate_transition_steps=_lr_transition_steps(rl_config, jax_config, num_envs),
         total_timesteps=int(rl_config["total_timesteps"]),
-        unroll_length=int(rl_config["n_steps"]),
+        unroll_length=get_rollout_length(rl_config),
+        reset_state_on_rollout=bool(jax_config.get("reset_state_on_rollout", True)),
         policy_repeat_steps=int(jax_config.get("policy_repeat_steps", 1)),
         batch_size=int(rl_config["batch_size"]),
         num_epochs=int(jax_config["num_epochs"]),
         discounting=float(jax_config["discounting"]),
+        cost_discounting=(float(jax_config["cost_discounting"])
+                          if jax_config.get("cost_discounting") is not None else None),
+        cost_terminal_at_time_limit=bool(jax_config.get("cost_terminal_at_time_limit", False)),
         gae_lambda=float(jax_config["gae_lambda"]),
         clipping_epsilon=float(jax_config["clipping_epsilon"]),
         entropy_cost=float(jax_config["entropy_cost"]),
         value_cost=float(jax_config["value_cost"]),
         normalize_advantage=bool(jax_config["normalize_advantage"]),
+        normalize_cost_advantage=(bool(jax_config["normalize_cost_advantage"])
+                                  if jax_config.get("normalize_cost_advantage") is not None else None),
+        cost_advantage_std_floor=float(jax_config.get("cost_advantage_std_floor", 0.0)),
         sampler_update_freq=int(jax_config["sampler_update_freq"]),
         gmm_components=int(jax_config["gmm_components"]),
         gmm_target_beta=float(jax_config["gmm_target_beta"]),
         gmm_init_std=float(jax_config["gmm_init_std"]),
-        policy_hidden_layer_sizes=(int(rl_config["actor_layer_size"]), int(rl_config["actor_layer_size"])),
-        value_hidden_layer_sizes=(int(rl_config["critic_layer_size"]), int(rl_config["critic_layer_size"])),
+        gmm_reward_fraction=float(jax_config.get("gmm_reward_fraction", 0.5)),
+        gmm_reward_kl_radius=float(jax_config.get("gmm_reward_kl_radius", 0.1)),
+        gmm_reward_dual_lr=float(jax_config.get("gmm_reward_dual_lr", 1e-3)),
+        gmm_cost_initial_beta=float(jax_config.get("gmm_cost_initial_beta", 1.0)),
+        gmm_cost_dual_lr=float(jax_config.get("gmm_cost_dual_lr", 1e-2)),
+        gmm_cost_dual_update=str(jax_config.get("gmm_cost_dual_update", "linear")),
+        gmm_cost_score_scale=float(jax_config.get("gmm_cost_score_scale", 1.0)),
+        gmm_dual_ema_decay=float(jax_config.get("gmm_dual_ema_decay", 0.9)),
+        gmm_cost_dual_ema_decay=(
+            None if jax_config.get("gmm_cost_dual_ema_decay") is None
+            else float(jax_config["gmm_cost_dual_ema_decay"])
+        ),
+        gmm_dual_lambda_min=float(jax_config.get("gmm_dual_lambda_min", 1e-3)),
+        gmm_dual_lambda_max=float(jax_config.get("gmm_dual_lambda_max", 1e3)),
+        gmm_reward_violation_clip=(
+            None
+            if jax_config.get("gmm_reward_violation_clip") is None
+            else float(jax_config["gmm_reward_violation_clip"])
+        ),
+        gmm_cost_violation_clip=(
+            None
+            if jax_config.get("gmm_cost_violation_clip") is None
+            else float(jax_config["gmm_cost_violation_clip"])
+        ),
+        policy_hidden_layer_sizes=_hidden_layer_sizes_from_config(rl_config, "actor_layer", "actor_layer_size"),
+        value_hidden_layer_sizes=_hidden_layer_sizes_from_config(rl_config, "critic_layer", "critic_layer_size"),
+        cost_value_hidden_layer_sizes=_hidden_layer_sizes_from_config(
+            jax_config, "cost_critic_layer", "cost_critic_layer"
+        ),
+        policy_use_layer_norm=bool(rl_config.get("actor_layer_norm", False)),
+        value_use_layer_norm=bool(rl_config.get("critic_layer_norm", False)),
         init_log_std=init_log_std,
         end_log_std=end_log_std,
+        use_ppo_lag=bool(jax_config.get("use_ppo_lag", False)),
+        safety_bound=float(jax_config.get("safety_bound", 0.0)),
+        lagrangian_coef_rate=float(jax_config.get("lagrangian_coef_rate", 0.01)),
+        initial_lambda_lagr=float(jax_config.get("initial_lambda_lagr", 0.0)),
+        constraint_cost_type=str(jax_config.get("constraint_cost_type", "edge")),
+        lagrangian_update_mode=str(jax_config.get("lagrangian_update_mode", "per_step")),
+        allow_partial_first_episode=bool(jax_config.get("allow_partial_first_episode", False)),
+        lagrangian_ema_decay=float(jax_config.get("lagrangian_ema_decay", 0.0)),
+        lagrangian_max=float(jax_config.get("lagrangian_max", 100.0)),
+        lagrangian_min_completed_episodes=int(jax_config.get("lagrangian_min_completed_episodes", 1)),
+        lagrangian_warmup_steps=int(jax_config.get("lagrangian_warmup_steps", 0)),
     )
 
 
@@ -175,6 +341,7 @@ def _build_env(
     auto_reset: bool = True,
     max_episode_steps: int | None = None,
     action_repeat_steps: int = 1,
+    constraint_cost_type: str = "edge",
     warn_track_pool: bool = True,
 ) -> F1TenthAdvWrapper:
     if warn_track_pool and gym_config.get("track_pool"):
@@ -206,6 +373,9 @@ def _build_env(
         slip_reward_target_deg=float(gym_config.get("slip_reward_target_deg", 45.0)),
         slip_reward_width_deg=float(gym_config.get("slip_reward_width_deg", 20.0)),
         slip_reward_shape=float(gym_config.get("slip_reward_shape", 2.5)),
+        edge_penalty_weight=float(gym_config.get("edge_penalty_weight", 1.0)),
+        edge_penalty_start_ratio=float(gym_config.get("edge_penalty_start_ratio", 0.8)),
+        termination_boundary_margin_ratio=float(gym_config.get("termination_boundary_margin_ratio", 1.0)),
         sensor_noise_enabled=bool(gym_config.get("sensor_noise_enabled", False)),
         sensor_noise_s_std=float(gym_config.get("sensor_noise_s_std", 0.0)),
         sensor_noise_n_std=float(gym_config.get("sensor_noise_n_std", 0.0)),
@@ -213,8 +383,8 @@ def _build_env(
     )
     if domain_randomization_ranges is None:
         domain_spec = make_domain_spec(
-            sigmas=gym_config["domain_randomization"],
-            clip_k=float(gym_config["dr_clip_k"]),
+            sigmas=gym_config.get("domain_randomization", {}),
+            clip_k=float(gym_config.get("dr_clip_k", 3.0)),
         )
     else:
         domain_spec = make_domain_spec(ranges=domain_randomization_ranges)
@@ -227,6 +397,7 @@ def _build_env(
         obs_delay_max_steps=int(gym_config.get("obs_delay_max_steps", gym_config.get("obs_delay_min_steps", 0))),
         asymmetric_critic=asymmetric_critic,
         action_repeat_steps=action_repeat_steps,
+        constraint_cost_type=constraint_cost_type,
     )
 
 
@@ -269,6 +440,7 @@ def _make_eval_fn(
             dynamics_params,
             policy_episode_steps,
             episodes_per_dynamics,
+            safety_bound=trainer.config.safety_bound if trainer.config.use_ppo_lag else None,
         )
         if episodes_per_dynamics == 1:
             episode_dynamics_params = dynamics_params
@@ -279,7 +451,11 @@ def _make_eval_fn(
     return jax.jit(run_eval) if jit else run_eval
 
 
-def _evaluation_schedule(num_updates: int, num_evals: int) -> tuple[bool, set[int]]:
+def _should_save_eval_video(config: SamplerPPOConfig, *, is_final: bool) -> bool:
+    return bool(config.eval_video and (not config.eval_video_final or is_final))
+
+
+def _evaluation_schedule(num_updates: int, num_evals: int, *, start_update: int = 0) -> tuple[bool, set[int]]:
     """Returns whether to eval before training and which completed updates to eval."""
     num_updates = int(num_updates)
     num_evals = int(num_evals)
@@ -294,7 +470,27 @@ def _evaluation_schedule(num_updates: int, num_evals: int) -> tuple[bool, set[in
         max(1, min(num_updates, math.ceil(idx * num_updates / (num_evals - 1))))
         for idx in range(1, num_evals)
     }
-    return True, eval_updates
+    return True, {update for update in eval_updates if update > start_update}
+
+
+def _restore_training_checkpoint(template, path: Path, *, num_envs: int,
+                                 rollout_length: int, target_updates: int):
+    """Restore the complete state, rejecting incompatible geometry or counters."""
+    from flax.serialization import from_bytes
+
+    state = from_bytes(template, Path(path).read_bytes())
+    if jax.tree_util.tree_structure(state) != jax.tree_util.tree_structure(template):
+        raise ValueError("Checkpoint training-state structure does not match this trainer")
+    for actual, expected in zip(jax.tree_util.tree_leaves(state), jax.tree_util.tree_leaves(template)):
+        if actual.shape != expected.shape or actual.dtype != expected.dtype:
+            raise ValueError("Checkpoint array shape/dtype does not match this trainer")
+    start_update = int(state.update_steps)
+    expected_steps = start_update * num_envs * rollout_length
+    if start_update < 0 or int(state.env_steps) != expected_steps:
+        raise ValueError("Checkpoint rollout geometry/counters are inconsistent")
+    if start_update >= target_updates:
+        raise ValueError("Resume target must exceed the checkpoint's completed updates")
+    return state
 
 
 def _save_sampler_plot(
@@ -306,7 +502,7 @@ def _save_sampler_plot(
     eval_index: int,
     env_steps: int,
 ) -> str | None:
-    if config.sampler_plot_samples <= 0 or trainer.env.domain_spec.size < 2:
+    if not config.domain_randomization or config.sampler_plot_samples <= 0 or trainer.env.domain_spec.size < 2:
         return None
 
     import matplotlib
@@ -356,7 +552,7 @@ def _save_sampler_plot(
         import wandb
 
         if wandb.run is not None:
-            wandb.log({"Sampler Heatmap": wandb.Image(str(plot_path))}, step=env_steps)
+            wandb.log({"evaluation/artifacts/sampler_heatmap": wandb.Image(str(plot_path))}, step=env_steps)
     except Exception:
         pass
     finally:
@@ -395,8 +591,8 @@ def _save_eval_render(
     render_image: bool | None = None,
     render_video: bool | None = None,
     file_label: str = "eval",
-    wandb_image_key: str = "Eval Trajectory",
-    wandb_video_key: str = "Eval Video",
+    wandb_image_key: str = "evaluation/artifacts/trajectory",
+    wandb_video_key: str = "evaluation/artifacts/video",
     title_label: str = "Eval Trajectory",
     subtitle: str | None = None,
 ) -> tuple[str | None, str | None]:
@@ -748,7 +944,7 @@ def _save_eval_percentile_videos(
 
         if wandb.run is not None:
             wandb.log(
-                {"eval_dynamics_percentile_params": wandb.Table(columns=columns, data=rows)},
+                {"evaluation/artifacts/dynamics_percentile_params": wandb.Table(columns=columns, data=rows)},
                 step=env_steps,
             )
     except Exception:
@@ -776,7 +972,7 @@ def _save_eval_percentile_videos(
             render_image=False,
             render_video=True,
             file_label=label,
-            wandb_video_key=f"eval_video_{label}",
+            wandb_video_key=f"evaluation/artifacts/video_{label}",
             title_label=f"Eval Video {label}",
             subtitle=subtitle,
         )
@@ -788,11 +984,32 @@ def _save_eval_percentile_videos(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--rl-config", type=Path, default=_CONFIG_DIR / "rl_config.yaml")
-    parser.add_argument("--gym-config", type=Path, default=_CONFIG_DIR / "gym_config.yaml")
+    parser.add_argument("--rl-config", type=Path, default=_CONFIG_DIR / "jax" / "rl_config.yaml")
+    parser.add_argument("--gym-config", type=Path, default=_CONFIG_DIR / "jax" / "gym_config.yaml")
+    parser.add_argument("--no-domain-randomization", action="store_true",
+                        help="Use nominal dynamics for both training and evaluation")
     parser.add_argument("--track", default=None, help="Optional explicit map override; default comes from gym_config.yaml")
     parser.add_argument("--seed", type=int, default=None, help="Override rl_config.yaml seed")
-    parser.add_argument("--sampler", choices=("uniform", "gmmvi"), default=None, help="Override jax_sampler_ppo.sampler")
+    parser.add_argument(
+        "--sampler",
+        choices=("uniform", "gmmvi", "reward_cost_gmmvi"),
+        default=None,
+        help="Override jax_sampler_ppo.sampler",
+    )
+    parser.add_argument(
+        "--gmm-target-beta",
+        "--gmm_target_beta",
+        dest="gmm_target_beta",
+        type=float,
+        default=None,
+        help="Override jax_sampler_ppo.gmm_target_beta",
+    )
+    parser.add_argument(
+        "--gmm-formulation",
+        choices=("reward", "cost", "reward_cost"),
+        default=None,
+        help="Use reward-only, cost-only, or a 50/50 reward+cost dual GMMVI batch",
+    )
     parser.add_argument("--num-envs", type=int, default=None, help="Optional override; default comes from jax_sampler_ppo.num_envs")
     parser.add_argument(
         "--num-eval-envs",
@@ -801,6 +1018,31 @@ def main() -> None:
         help="Optional override; 0 disables periodic JAX evaluation",
     )
     parser.add_argument("--num-evals", type=int, default=None, help="Total number of JAX evaluations")
+    parser.add_argument(
+        "--dr-profile",
+        default=None,
+        help="Named JAX domain-randomization profile from rl_config.yaml",
+    )
+    parser.add_argument("--ppo-lag", action="store_true", help="Enable CRAX PPO-Lagrange")
+    parser.add_argument(
+        "--constraint-cost",
+        choices=("edge", "collision"),
+        default=None,
+        help="PPO-Lag constraint signal: continuous edge penalty or binary terminal collision",
+    )
+    parser.add_argument("--safety-bound", type=float, default=None, help="PPO-Lag cumulative constraint-cost budget per episode")
+    parser.add_argument(
+        "--lagrangian-coef-rate",
+        type=float,
+        default=None,
+        help="PPO-Lag Lagrange-multiplier update rate",
+    )
+    parser.add_argument(
+        "--initial-lambda-lagr",
+        type=float,
+        default=None,
+        help="PPO-Lag initial non-negative Lagrange multiplier",
+    )
     parser.add_argument("--eval-episode-steps", type=int, default=None, help="Separate JAX eval episode length")
     parser.add_argument(
         "--eval-episodes-per-dynamics",
@@ -818,12 +1060,27 @@ def main() -> None:
     parser.add_argument("--eval-video-max-frames", type=int, default=None, help="Maximum frames per eval trajectory video")
     parser.add_argument("--updates", type=int, default=None, help="Optional override; default derives from total_timesteps")
     parser.add_argument("--onnx-output", default="", help="Optional path to export the deterministic actor as ONNX")
+    parser.add_argument("--checkpoint-output", type=Path, default=None,
+                        help="Save final full JAX training state for reproducibility")
+    parser.add_argument("--resume-checkpoint", type=Path, default=None,
+                        help="Restore full state; total_timesteps is the absolute training target")
     parser.add_argument("--no-wandb", action="store_true", help="Disable WandB logging for this run")
+    parser.add_argument(
+        "--wandb-save-code",
+        action="store_true",
+        help="Enable WandB code saving and git probing for this run",
+    )
     parser.add_argument("--no-jit", action="store_true")
     args = parser.parse_args()
 
     rl_config = _load_yaml(args.rl_config)
     gym_config = _load_yaml(args.gym_config)
+
+    # Make a command-line track override part of the effective experiment
+    # configuration before WandB is initialized.  This keeps the run name and
+    # logged config aligned with the environment that is actually trained.
+    if args.track is not None:
+        gym_config["map"] = args.track
 
     if rl_config.get("use_custom_relu"):
         raise NotImplementedError("JAX sampler PPO currently supports the default tanh MLP only; set use_custom_relu: false.")
@@ -832,10 +1089,37 @@ def main() -> None:
         rl_config["seed"] = args.seed
     if args.sampler is not None:
         rl_config["jax_sampler_ppo"]["sampler"] = args.sampler
+    if args.gmm_target_beta is not None:
+        rl_config["jax_sampler_ppo"]["gmm_target_beta"] = args.gmm_target_beta
+    if args.gmm_formulation is not None:
+        formulation_fraction = {"reward": 1.0, "cost": 0.0, "reward_cost": 0.5}
+        rl_config["jax_sampler_ppo"]["sampler"] = "reward_cost_gmmvi"
+        rl_config["jax_sampler_ppo"]["gmm_formulation"] = args.gmm_formulation
+        rl_config["jax_sampler_ppo"]["gmm_reward_fraction"] = formulation_fraction[args.gmm_formulation]
+    if args.no_domain_randomization:
+        rl_config["jax_sampler_ppo"]["domain_randomization"] = False
+        rl_config["jax_sampler_ppo"]["eval_domain_randomization"] = False
     if args.num_eval_envs is not None:
         rl_config["jax_sampler_ppo"]["num_eval_envs"] = args.num_eval_envs
     if args.num_evals is not None:
         rl_config["jax_sampler_ppo"]["num_evals"] = args.num_evals
+    if args.dr_profile is not None:
+        profiles = rl_config["jax_sampler_ppo"].get("domain_randomization_profiles", {})
+        if args.dr_profile not in profiles:
+            available = ", ".join(sorted(profiles)) or "none"
+            raise ValueError(f"Unknown DR profile {args.dr_profile!r}; available profiles: {available}")
+        rl_config["jax_sampler_ppo"]["domain_randomization_ranges"] = profiles[args.dr_profile]
+        rl_config["jax_sampler_ppo"]["domain_randomization_profile"] = args.dr_profile
+    if args.ppo_lag:
+        rl_config["jax_sampler_ppo"]["use_ppo_lag"] = True
+    if args.constraint_cost is not None:
+        rl_config["jax_sampler_ppo"]["constraint_cost_type"] = args.constraint_cost
+    if args.safety_bound is not None:
+        rl_config["jax_sampler_ppo"]["safety_bound"] = args.safety_bound
+    if args.lagrangian_coef_rate is not None:
+        rl_config["jax_sampler_ppo"]["lagrangian_coef_rate"] = args.lagrangian_coef_rate
+    if args.initial_lambda_lagr is not None:
+        rl_config["jax_sampler_ppo"]["initial_lambda_lagr"] = args.initial_lambda_lagr
     if args.eval_episode_steps is not None:
         rl_config["jax_sampler_ppo"]["eval_episode_steps"] = args.eval_episode_steps
     if args.eval_episodes_per_dynamics is not None:
@@ -856,8 +1140,27 @@ def main() -> None:
         rl_config["jax_sampler_ppo"]["eval_video_dir"] = str(args.eval_video_dir)
     if args.eval_video_max_frames is not None:
         rl_config["jax_sampler_ppo"]["eval_video_max_frames"] = args.eval_video_max_frames
+    if args.resume_checkpoint is not None:
+        rl_config["resume_checkpoint"] = str(args.resume_checkpoint.resolve())
 
-    wandb_started_here = _init_wandb(gym_config, rl_config, disabled=args.no_wandb)
+    wandb_started_here = _init_wandb(
+        gym_config,
+        rl_config,
+        disabled=args.no_wandb,
+        save_code=args.wandb_save_code,
+    )
+    run_output_label = _run_output_label()
+    scoped_dir_keys = tuple(
+        key
+        for key, overridden in (
+            ("sampler_plot_dir", args.sampler_plot_dir is not None),
+            ("eval_render_dir", args.eval_render_dir is not None),
+            ("eval_video_dir", args.eval_video_dir is not None),
+        )
+        if not overridden
+    )
+    _apply_scoped_output_dirs(rl_config, run_output_label, scoped_keys=scoped_dir_keys)
+    _wandb_update_config({"rl_config": rl_config})
     jax_config = rl_config["jax_sampler_ppo"]
     domain_randomization_ranges = jax_config.get("domain_randomization_ranges")
     asymmetric_critic = bool(jax_config.get("asymmetric_critic", False))
@@ -883,15 +1186,31 @@ def main() -> None:
         domain_randomization_ranges=domain_randomization_ranges,
         asymmetric_critic=asymmetric_critic,
         action_repeat_steps=config.policy_repeat_steps,
+        constraint_cost_type=config.constraint_cost_type,
     )
 
     trainer = SamplerPPOTrainer(env, config)
     state = trainer.init_state(jax.random.PRNGKey(int(rl_config["seed"])))
+    resume_path = rl_config.get("resume_checkpoint")
+    if resume_path:
+        resume_path = Path(resume_path)
+        if args.checkpoint_output is not None and args.checkpoint_output.resolve() == resume_path.resolve():
+            raise ValueError("Resume output must not overwrite the source checkpoint")
+        state = _restore_training_checkpoint(state, resume_path, num_envs=num_envs,
+                                             rollout_length=config.unroll_length,
+                                             target_updates=updates)
+        rl_config["resume_from_update"] = int(state.update_steps)
+        _wandb_update_config({"rl_config": rl_config})
+        print(f"Restored full training state: updates={int(state.update_steps)} "
+              f"steps={int(state.env_steps)} lambda={float(state.lambda_lagr):.6f} "
+              f"source={resume_path}")
+    start_update = int(state.update_steps)
     step_fn = trainer.training_step if args.no_jit else jax.jit(trainer.training_step)
     eval_key = jax.random.PRNGKey(int(rl_config.get("eval_seed", rl_config["seed"] + 1)))
     eval_fn = None
     render_env = None
-    run_initial_eval, eval_updates = _evaluation_schedule(updates, config.num_evals)
+    run_initial_eval, eval_updates = _evaluation_schedule(updates, config.num_evals,
+                                                        start_update=start_update)
     eval_count = 0
     if config.num_eval_envs > 0:
         eval_env = _build_env(
@@ -903,6 +1222,7 @@ def main() -> None:
             asymmetric_critic=asymmetric_critic,
             max_episode_steps=config.eval_episode_steps,
             action_repeat_steps=config.policy_repeat_steps,
+            constraint_cost_type=config.constraint_cost_type,
             warn_track_pool=False,
         )
         eval_fn = _make_eval_fn(
@@ -924,6 +1244,7 @@ def main() -> None:
                 auto_reset=False,
                 max_episode_steps=config.eval_episode_steps,
                 action_repeat_steps=config.policy_repeat_steps,
+                constraint_cost_type=config.constraint_cost_type,
                 warn_track_pool=False,
             )
 
@@ -935,7 +1256,8 @@ def main() -> None:
         f"sampler={config.sampler}, envs={num_envs}, unroll={config.unroll_length}, "
         f"policy_repeat={config.policy_repeat_steps}, batch_size={config.batch_size}, "
         f"updates={updates}, eval_envs={config.num_eval_envs}, "
-        f"num_evals={config.num_evals}, eval_episodes_per_dynamics={config.eval_episodes_per_dynamics}"
+        f"num_evals={config.num_evals}, eval_episodes_per_dynamics={config.eval_episodes_per_dynamics}, "
+        f"constraint_cost={config.constraint_cost_type}, safety_bound={config.safety_bound:g}"
     )
     print(f"Control rate: physics={physics_hz:.1f} Hz, policy={policy_hz:.1f} Hz")
     print(
@@ -953,13 +1275,21 @@ def main() -> None:
         f"(step={config.eval_video_percentile_step}, "
         f"{'final eval only' if config.eval_video_final else 'every eval'})"
     )
+    print(
+        "Artifact dirs: "
+        f"sampler_plots={config.sampler_plot_dir}, "
+        f"eval_renders={config.eval_render_dir}, "
+        f"eval_videos={config.eval_video_dir}"
+    )
     if eval_fn is not None and run_initial_eval:
         eval_count += 1
         eval_key, key_eval, key_plot, key_render = jax.random.split(eval_key, 4)
         eval_metrics, eval_rewards, eval_lengths, eval_dynamics_params = eval_fn(state.params, key_eval)
         eval_metrics = _metric_dict(eval_metrics)
         eval_metrics["eval/index"] = eval_count
-        eval_metrics["eval/update"] = 0
+        eval_metrics["eval/update"] = start_update
+        eval_metrics["evaluation/meta/index"] = eval_count
+        eval_metrics["evaluation/meta/update"] = start_update
         eval_logged = _wandb_log(eval_metrics, int(state.env_steps))
         sampler_plot = _save_sampler_plot(
             trainer,
@@ -970,7 +1300,7 @@ def main() -> None:
             env_steps=int(state.env_steps),
         )
         key_render_single, key_render_percentiles = jax.random.split(key_render)
-        should_save_eval_video = not config.eval_video_final
+        should_save_eval_video = _should_save_eval_video(config, is_final=False)
         eval_render, eval_video = (
             _save_eval_render(
                 trainer,
@@ -1002,14 +1332,14 @@ def main() -> None:
             else (None, {})
         )
         print(
-            f"eval index={eval_count} update=0 steps={int(state.env_steps)} "
+            f"eval index={eval_count} update={start_update} steps={int(state.env_steps)} "
             f"wandb_logged={eval_logged} sampler_plot={sampler_plot} "
             f"eval_render={eval_render} eval_video={eval_video} "
             f"eval_percentile_csv={eval_percentile_csv} "
             f"eval_percentile_videos={len(eval_percentile_videos)}"
         )
 
-    for update in range(updates):
+    for update in range(start_update, updates):
         update_number = update + 1
         state, metrics = step_fn(state)
         metrics = _metric_dict(metrics)
@@ -1026,6 +1356,8 @@ def main() -> None:
             eval_metrics = _metric_dict(eval_metrics)
             eval_metrics["eval/index"] = eval_count
             eval_metrics["eval/update"] = update_number
+            eval_metrics["evaluation/meta/index"] = eval_count
+            eval_metrics["evaluation/meta/update"] = update_number
             eval_logged = _wandb_log(eval_metrics, env_steps)
             eval_count_for_message = eval_count
             sampler_plot = _save_sampler_plot(
@@ -1037,7 +1369,7 @@ def main() -> None:
                 env_steps=int(state.env_steps),
             )
             key_render_single, key_render_percentiles = jax.random.split(key_render)
-            should_save_eval_video = (not config.eval_video_final) or is_final_eval
+            should_save_eval_video = _should_save_eval_video(config, is_final=is_final_eval)
             eval_render, eval_video = (
                 _save_eval_render(
                     trainer,
@@ -1077,13 +1409,25 @@ def main() -> None:
         message = (
             f"update={update_number} "
             f"steps={env_steps} "
-            f"return_mean={metrics['train/rollout_return_mean']:.3f} "
+            f"reward={metrics['training/reward/rollout_return_mean']:.3f} "
+            f"cost={metrics['training/cost/rollout_cost_mean']:.4f} "
+            f"cost_violation={metrics['training/cost/signed_violation_mean']:.4f} "
+            f"cost_satisfied={metrics['training/cost/satisfied_rate']:.3f} "
             f"loss={metrics['loss/total']:.3f} "
             f"wandb_logged={train_logged}"
         )
         if eval_count_for_message is not None:
             message += (
                 f" eval_index={eval_count_for_message} "
+                f"eval_reward={eval_metrics['evaluation/reward/episode_return_mean']:.3f} "
+                f"eval_cost={eval_metrics['evaluation/cost/episode_cost_mean']:.4f} "
+            )
+            if config.use_ppo_lag:
+                message += (
+                    f"eval_cost_violation={eval_metrics['evaluation/cost/signed_violation_mean']:.4f} "
+                    f"eval_cost_satisfied={eval_metrics['evaluation/cost/satisfied_rate']:.3f} "
+                )
+            message += (
                 f"eval_wandb_logged={eval_logged} "
                 f"sampler_plot={sampler_plot} "
                 f"eval_render={eval_render} "
@@ -1093,7 +1437,25 @@ def main() -> None:
             )
         print(message)
 
+    if args.checkpoint_output is not None:
+        import json
+        from flax.serialization import to_bytes
+        args.checkpoint_output.parent.mkdir(parents=True, exist_ok=True)
+        args.checkpoint_output.write_bytes(to_bytes(jax.device_get(state)))
+        final_metrics = _metric_dict(metrics)
+        if eval_fn is not None and (run_initial_eval or eval_updates):
+            final_metrics.update(eval_metrics)
+        final_metrics.update({
+            "training/progress/env_steps": int(state.env_steps),
+            "training/progress/update_steps": int(state.update_steps),
+            "training/constraint/lambda_lagr": float(state.lambda_lagr),
+        })
+        args.checkpoint_output.with_suffix(".summary.json").write_text(
+            json.dumps(final_metrics, indent=2))
+        print(f"Saved final JAX checkpoint: {args.checkpoint_output}")
     if args.onnx_output:
+        from gymkhana.jax_sampler_ppo import export_trainer_policy_to_onnx
+
         export_trainer_policy_to_onnx(trainer, state, args.onnx_output)
         print(f"Exported ONNX policy: {args.onnx_output}")
 
@@ -1101,6 +1463,20 @@ def main() -> None:
         try:
             import wandb
 
+            completion_text = (
+                f"Track={gym_config['map']}, sampler={config.sampler}, "
+                f"seed={rl_config['seed']}, steps={int(state.env_steps)}"
+            )
+            if eval_fn is not None and (run_initial_eval or eval_updates):
+                completion_text += (
+                    f"\nEvaluation return={eval_metrics['evaluation/reward/episode_return_mean']:.2f}, "
+                    f"collision rate={eval_metrics['evaluation/collision/rate']:.2%}, "
+                    f"{config.constraint_cost_type} cost budget={config.safety_bound:g}"
+                )
+            try:
+                wandb.alert(title="F1 training completed", text=completion_text, level="INFO", wait_duration=0)
+            except Exception as exc:
+                print(f"W&B completion alert failed: {exc}")
             wandb.finish()
         except Exception:
             pass

@@ -20,6 +20,14 @@ Usage:
     python train/ppo_race.py --m c --path /path/to/model.zip --additional_timesteps 10000000
 """
 
+import sys
+from pathlib import Path
+
+if __package__ in (None, ""):
+    repo_root = str(Path(__file__).resolve().parents[1])
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+
 from train.config.env_config import PROJECT_NAME, TRACK_POOL, get_drift_test_config, get_drift_train_config
 from train.train_common import TrainingProfile, main
 

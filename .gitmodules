@@ -1,11 +1,4 @@
-[submodule "maps"]
-	path = maps
-	url = https://github.com/TeoIlie/F1TENTH_Racetracks.git
-	branch = main
 [submodule "examples/analysis/commonroad"]
 	path = examples/analysis/commonroad
 	url = https://github.com/TeoIlie/commonroad-vehicle-models.git
 	branch = master
-[submodule "F1TENTH_Racetracks"]
-	path = F1TENTH_Racetracks
-	url = https://github.com/TeoIlie/F1TENTH_Racetracks.git

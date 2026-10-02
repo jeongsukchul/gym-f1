@@ -1,0 +1,68 @@
+# JAX environment only. DR ranges live in this directory's rl_config.yaml.
+project_name: "f1tenth-ppo-drift"
+
+timestep: 0.01
+
+max_episode_steps: 4096
+
+progress_gain: 5.0
+
+out_of_bounds_penalty: -50.0
+
+negative_vel_penalty: -1.0
+
+slip_reward_enabled: true
+
+slip_reward_path_weight: 1.
+
+slip_reward_slip_weight: 0.
+
+slip_reward_target_deg: 40.0
+
+slip_reward_width_deg: 15.0
+
+slip_reward_shape: 2.5
+
+edge_penalty_weight: 10.0
+
+edge_penalty_start_ratio: 0.8
+
+termination_boundary_margin_ratio: 1.2  # allow a small off-track buffer so hard DR degrades reward before resetting
+
+map: "CircleDrift"
+  # - "Drift"
+  # - "Drift_mirror"
+  # - "Drift2"
+  # - "Drift2_mirror"
+
+evaluation_track_pool:
+  - "CircleDrift"
+
+sparse_width_obs: true
+
+lookahead_n_points: 5
+
+lookahead_ds: 0.5
+
+normalize_obs: true
+
+mask_track_obs: false  # expose curvature and width lookahead to the actor
+
+obs_history_len: 6    # stack recent observations for dynamics/friction inference
+
+obs_delay_min_steps: 1  # per-episode UniformInt lower bound, in policy-observation steps
+
+obs_delay_max_steps: 3  # per-episode UniformInt upper bound, inclusive
+
+sensor_noise_enabled: true
+
+sensor_noise_s_std: 0.005       # [m] centerline arc-length measurement noise; affects lookahead sampling only
+
+sensor_noise_n_std: 0.005       # [m] lateral Frenet measurement noise before normalization
+
+sensor_noise_psi_std_deg: .5  # [deg] heading-error measurement noise before normalization
+
+track_direction: "normal"
+
+steering_delay_steps: 2
+

@@ -3,7 +3,6 @@ import jax
 import matplotlib.pyplot as plt
 import chex
 from typing import List, Optional, Sequence, Tuple
-import wandb
 import numpy as np
 from matplotlib.ticker import MaxNLocator
 

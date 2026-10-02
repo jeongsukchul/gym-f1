@@ -9,18 +9,20 @@ import yaml
 
 from gymkhana.envs.gymkhana_env import GKEnv
 from gymkhana.presets import drift_config
+from train.config.rollout import get_rollout_length
 
 # ====================================
 # RL config
 # ====================================
-_rl_config_path = os.path.join(os.path.dirname(__file__), "rl_config.yaml")
+_rl_config_path = os.path.join(os.path.dirname(__file__), "ppo", "rl_config.yaml")
 with open(_rl_config_path, "r") as f:
     _rl_config = yaml.safe_load(f)
 
 # RL training parameters
 N_ENVS = _rl_config["core_mult"] * multiprocessing.cpu_count()  # CPU core count * multiplier
 TOTAL_TIMESTEPS = _rl_config["total_timesteps"]
-N_STEPS = _rl_config["n_steps"]
+ROLLOUT_LENGTH = get_rollout_length(_rl_config)
+N_STEPS = ROLLOUT_LENGTH  # Compatibility for external imports; SB3 API uses n_steps.
 BATCH_SIZE = _rl_config["batch_size"]
 START_LEARNING_RATE = _rl_config["start_learning_rate"]
 END_LEARNING_RATE = _rl_config["end_learning_rate"]
@@ -28,8 +30,24 @@ SEED = _rl_config["seed"]
 EVAL_SEED = _rl_config["eval_seed"]
 ACT_FUNC_NEG_SLOPE = _rl_config["act_func_neg_slope"]
 USE_CUSTOM_RELU = _rl_config["use_custom_relu"]
-ACTOR_LAYER_SIZE = _rl_config["actor_layer_size"]
-CRITIC_LAYER_SIZE = _rl_config["critic_layer_size"]
+
+
+def _parse_hidden_layers(config: dict, key: str, legacy_key: str) -> tuple[int, ...]:
+    value = config.get(key, config.get(legacy_key))
+    if value is None:
+        raise KeyError(f"Missing required RL config key '{key}'")
+    if isinstance(value, int):
+        return (int(value), int(value))
+    if not isinstance(value, (list, tuple)) or len(value) == 0:
+        raise ValueError(f"RL config key '{key}' must be a non-empty list of positive ints, got {value!r}")
+    layers = tuple(int(width) for width in value)
+    if any(width <= 0 for width in layers):
+        raise ValueError(f"RL config key '{key}' must contain only positive ints, got {value!r}")
+    return layers
+
+
+ACTOR_LAYER = _parse_hidden_layers(_rl_config, "actor_layer", "actor_layer_size")
+CRITIC_LAYER = _parse_hidden_layers(_rl_config, "critic_layer", "critic_layer_size")
 ADDITIONAL_TIMESTEPS = _rl_config["additional_timesteps"]
 TRANSFER_RESET_LOG_STD = _rl_config["transfer_reset_log_std"]
 TRANSFER_RESET_CRITIC = _rl_config["transfer_reset_critic"]
@@ -46,7 +64,7 @@ if LOG_STD_SCHEDULE is not None:
 # ====================================
 # Gym config
 # ====================================
-_config_path = os.path.join(os.path.dirname(__file__), "gym_config.yaml")
+_config_path = os.path.join(os.path.dirname(__file__), "ppo", "gym_config.yaml")
 with open(_config_path, "r") as f:
     _config = yaml.safe_load(f)
 

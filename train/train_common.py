@@ -22,17 +22,17 @@ from train.callbacks import (
     make_obs_min_max_callback,
 )
 from train.config.env_config import (
-    ACTOR_LAYER_SIZE,
+    ACTOR_LAYER,
     ADDITIONAL_TIMESTEPS,
     BEST_MODEL,
     BATCH_SIZE,
     CKPT_SAVE_FREQ,
-    CRITIC_LAYER_SIZE,
+    CRITIC_LAYER,
     END_LEARNING_RATE,
     EVAL_SEED,
     LOG_STD_SCHEDULE,
     N_ENVS,
-    N_STEPS,
+    ROLLOUT_LENGTH,
     PARAMS,
     SEED,
     START_LEARNING_RATE,
@@ -182,7 +182,7 @@ def train(profile: TrainingProfile):
     learning_rate = linear_schedule(START_LEARNING_RATE, END_LEARNING_RATE)
 
     policy_kwargs = dict(
-        net_arch=dict(pi=[ACTOR_LAYER_SIZE, ACTOR_LAYER_SIZE], vf=[CRITIC_LAYER_SIZE, CRITIC_LAYER_SIZE]),
+        net_arch=dict(pi=list(ACTOR_LAYER), vf=list(CRITIC_LAYER)),
     )
     if LOG_STD_SCHEDULE is not None:
         policy_kwargs["log_std_init"] = LOG_STD_SCHEDULE["init"]
@@ -192,7 +192,7 @@ def train(profile: TrainingProfile):
     model = PPO(
         policy="MlpPolicy",
         env=env,
-        n_steps=N_STEPS,
+        n_steps=ROLLOUT_LENGTH,
         batch_size=BATCH_SIZE,
         verbose=1,
         tensorboard_log=tensorboard_dir,

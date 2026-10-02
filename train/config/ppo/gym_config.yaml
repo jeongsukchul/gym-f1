@@ -1,0 +1,76 @@
+# Gym + Stable-Baselines3 race/recovery environment.
+# Gaussian domain randomization and callback settings are SB3-specific.
+project_name: "f1tenth-ppo-drift"
+
+race_training_mode: "race"
+
+timestep: 0.01
+
+max_episode_steps: 4096
+
+progress_gain: 5.0
+
+out_of_bounds_penalty: -50.0
+
+negative_vel_penalty: -1.0
+
+num_beams: 2
+
+map: "CircleDrift"
+
+evaluation_track_pool:
+  - "CircleDrift"
+
+record_obs_min_max: true
+
+sparse_width_obs: true
+
+lookahead_n_points: 5
+
+lookahead_ds: 0.5
+
+normalize_obs: true
+
+track_direction: "normal"
+
+prevent_instability: true # enables integration instability checking with reset
+
+dr_clip_k: 3.0
+
+test_debug_render: false
+
+train_debug_render: false
+
+ckpt_save_freq: 10000 # reused for EvalCallback and custom CurriculumLearningCallback
+
+n_eval_episodes: 15
+
+recovery_project_name: "f1tenth-ppo-recover"
+
+recovery_training_mode: "recover"
+
+recovery_track_pool: null # train only on IMS
+
+domain_randomization:
+  m: 0.05         # mass
+  I_z: 0.02       # yaw inertia
+  lf: 0.05        # CoG fore-distance; lr auto-tracks (wheelbase preserved)
+  s_max: 0.03     # max steering angle; s_min auto-mirrors
+  sv_max: 0.02    # max steering velocity; sv_min auto-mirrors
+
+curriculum:
+  # see train/callbacks.py for more details about parameter uses
+  enabled: false
+  n_stages: 6
+  window_size: 500
+  success_threshold: 0.8
+  min_episodes_between_expansions: 1000
+  max_curriculum_timestep: null
+  # Each range: [initial_lo, initial_hi, max_lo, max_hi]
+  v_range:    [5.0, 9.0, 2.0, 12.0]
+  beta_range: [-0.10, 0.10, -0.349, 0.349]
+  r_range:    [-0.20, 0.20, -0.785, 0.785]
+  yaw_range:  [-0.20, 0.20, -0.785, 0.785]
+
+# Explicit single-track default, required by env_config.py.
+track_pool: null

@@ -7,21 +7,25 @@ eval_seed: 1000
 core_mult: 2  # n_envs = core_mult * [# of CPU cores]
               # experimentally, the ideal number of envs was found to be 2 x [# of CPU cores]
 total_timesteps: 200000000  # 120 million timesteps
-n_steps: 1024  # Number of steps per rollout per environment
-batch_size: 512  # PPO minibatch size; larger batches reduce optimizer overhead with many envs
-start_learning_rate: 0.0003 # initial learning rate
-end_learning_rate: 0.0001 # final learning rate, with linear decay
+# Short PPO rollout requested. first_episode cost requires episode continuation
+# across rollouts before this can be used with a longer episode horizon.
+n_steps: 1024
+batch_size: 8192  # PPO minibatch size; larger batches reduce optimizer overhead with many envs
+start_learning_rate: 1e-4 # initial learning rate
+end_learning_rate: 5e-5 # final learning rate, with linear decay
 act_func_neg_slope: 0.2  # actor, critic LeakyReLU negative slope
 use_custom_relu: false   # if true, use LeakyReLU (with act_func_neg_slope) instead of default Tanh
-actor_layer_size: 64     # hidden layer size for actor (pi) network (2 layers)
-critic_layer_size: 128    # hidden layer size for critic (vf) network (2 layers)
+actor_layer: [256, 256, 256]   # hidden layer sizes for actor (pi) network
+critic_layer: [256, 256, 256]  # hidden layer sizes for critic (vf) network
+actor_layer_norm: false        # apply LayerNorm after each actor hidden layer
+critic_layer_norm: true       # apply LayerNorm after each critic hidden layer
 
 # log_std schedule for fresh training (--m t). Linear anneal init -> end over total_timesteps.
 # Closes the stochastic-vs-deterministic train/eval gap. Comment out block to disable.
 # See docs/training.rst for rationale.
 log_std_schedule:
-  init: -1.0    # σ ≈ 0.37
-  end: -3.0     # σ ≈ 0.05
+  init: -.4    # σ ≈ 0.37
+  end: -.4     # σ ≈ 0.05
 
 # Transfer/continue training defaults (mode 'f')
 additional_timesteps: 100000000  # additional timesteps for transfer/continue training
@@ -30,67 +34,106 @@ transfer_reset_critic: true  # reinitialize critic to random weights
 
 # JAX sampler PPO settings. These are ignored by the SB3 trainer.
 jax_sampler_ppo:
-  sampler: uniform  # uniform or gmmvi
-  asymmetric_critic: false  # if false, critic uses the same observation as the actor
-  num_envs: 1024
-  num_eval_envs: 16384
+  sampler: reward_cost_gmmvi  # uniform, gmmvi, or separate reward/cost GMMVI
+  asymmetric_critic: true  # if false, critic uses the same observation as the actor
+  num_envs: 256  # 256 × 2048 = the previous 1024 × 512 samples/update
+  num_eval_envs: 1024
   policy_repeat_steps: 2      # 50 Hz policy on 100 Hz physics (hold each action for 2 sim steps)
   num_evals: 10
-  eval_episode_steps: 4096       # physics-step horizon; policy decisions are ceil(this / policy_repeat_steps)
+  eval_episode_steps: 12288      # 3x training horizon; 6144 policy decisions at repeat=2
   eval_episodes_per_dynamics: 10  # repeat eval episodes per selected dynamics parameter vector
   sampler_plot_samples: 4096
   sampler_plot_grid: 50
   sampler_plot_context_samples: 64
   sampler_plot_max_dims: 30
-  sampler_plot_dir: "outputs/jax_sampler_ppo/sampler_plots"
-  eval_render: true
-  eval_render_dir: "outputs/jax_sampler_ppo/eval_renders"
+  sampler_plot_dir: "outputs/jax_sampler_ppo/sampler_plots"  # base dir; trainer appends sampler/seed/run
+  eval_render: true             # lightweight trajectory PNG at every evaluation
+  eval_render_dir: "outputs/jax_sampler_ppo/eval_renders"    # base dir; trainer appends sampler/seed/run
   eval_video: true
-  eval_video_dir: "outputs/jax_sampler_ppo/eval_videos"
-  eval_video_fps: 50              # realtime for 100 Hz physics with policy_repeat_steps=2
-  eval_video_max_frames: 2048     # keep full 4096-step eval horizon at 50 Hz, no temporal downsampling
-  eval_video_final: true          # create/log eval videos only on the final scheduled eval
+  eval_video_dir: "outputs/jax_sampler_ppo/eval_videos"      # base dir; trainer appends sampler/seed/run
+  eval_video_fps: 25              # lower playback rate; frame count controls render cost
+  eval_video_max_frames: 256       # decimate 6144 policy decisions to 256 encoded frames
+  eval_video_final: true           # create/log one video only on the final scheduled eval
   eval_domain_randomization: true  # sample eval dynamics across eval envs for reward percentiles
-  eval_video_percentiles: true     # render p0, p5, ..., p100 selected dynamics trajectories
+  eval_video_percentiles: false     # render p0, p5, ..., p100 selected dynamics trajectories
   eval_video_percentile_step: 10
   # JAX DR uses explicit multiplicative bounds:
   # low = nominal * range[0], high = nominal * range[1]
   domain_randomization_ranges:
-    m: [0.95, 1.05]        # mass
-    I_z: [0.90, 1.15]      # yaw inertia
-    lf: [0.95, 1.05]       # CoG fore-distance; lr auto-tracks
-    h_s: [0.80, 1.25]      # CoG height / load transfer strength
-    s_max: [0.95, 1.05]    # max steering angle; s_min auto-mirrors
-    sv_max: [0.80, 1.20]   # max steering velocity; sv_min auto-mirrors
-    T_steer: [0.70, 1.40]  # first-order steering response time
-    a_max: [0.80, 1.20]    # max longitudinal acceleration
-    v_switch: [0.80, 1.20] # power-limited acceleration transition
-    R_w: [0.95, 1.05]      # tire radius, affects slip ratio and wheel speed
-    I_y_w: [0.70, 1.40]    # wheel inertia, affects wheelspin transient
-    T_sb: [0.70, 1.30]     # brake torque split front/rear
-    T_se: [0.40, 1.60]     # drive torque split front/rear
-    tire_p_dx1: [0.8, 1.20]  # longitudinal tire friction peak
-    tire_p_dy1: [0.9, 1.20]  # lateral tire friction peak
-    tire_p_kx1: [0.50, 1.20]  # longitudinal tire stiffness
-    tire_p_ky1: [0.50, 1.30]  # lateral tire stiffness
-    tire_p_cx1: [0.85, 1.15]  # longitudinal Magic Formula shape
-    tire_p_cy1: [0.85, 1.15]  # lateral Magic Formula shape
-    tire_p_ex1: [0.50, 1.50]  # longitudinal tire peak curvature
-    tire_p_ey1: [0.5, 1.20]  # lateral tire peak curvature
-    tire_r_bx1: [0.50, 1.20]  # combined-slip longitudinal reduction slope
-    tire_r_bx2: [0.70, 1.30]  # combined-slip Fx coupling variation
-    tire_r_by1: [0.50, 1.20]  # combined-slip lateral reduction slope
-    tire_r_by2: [0.70, 1.30]  # combined-slip Fy coupling variation
-    tire_r_by3: [0.70, 1.30]  # lateral combined-slip alpha shift
-    tire_r_vy1: [0.50, 1.50]  # kappa-induced lateral force
-  num_epochs: 10
+    m: [0.7, 1.3]
+    I_z: [0.7, 1.3]
+    # lf: [0.95, 1.05]
+    # h_s: [0.90, 1.12]
+    # s_max: [0.95, 1.05]
+    # sv_max: [0.90, 1.10]
+    T_steer: [0.60, 1.30]
+    a_max: [0.6, 1.3]
+    # v_switch: [0.88, 1.12]
+    # R_w: [0.97, 1.03]
+    # I_y_w: [0.85, 1.15]
+    # T_sb: [0.85, 1.15]
+    # T_se: [0.80, 1.20]
+    tire_p_dx1: [.5, 2.5]
+    tire_p_dy1: [.5, 2.5]
+    tire_p_kx1: [0.5, 2.5]
+    tire_p_ky1: [0.5, 2.5]
+    # tire_p_cx1: [0.85, 1.15]
+    # tire_p_cy1: [0.92, 1.08]
+    # tire_p_ex1: [0.80, 1.20]
+    # tire_p_ey1: [0.85, 1.15]
+    # tire_r_bx1: [0.85, 1.15]
+    # tire_r_bx2: [0.90, 1.10]
+    # tire_r_by1: [1., 1.5]
+    # tire_r_by2: [0.70, 1.30]
+    # tire_r_by3: [0.90, 1.10]
+    # tire_r_vy1: [0.85, 1.15]
+  # Named DR profiles can be selected with --dr-profile without changing the
+  # baseline ranges above.  ``narrow`` is intentionally moderate: it still
+  # covers vehicle/tyre mismatch while avoiding the previous 0.5x--2.5x tyre
+  # extremes during initial PPO-Lag policy learning.
+  domain_randomization_profiles:
+    narrow:
+      m: [0.85, 1.15]
+      I_z: [0.85, 1.15]
+      T_steer: [0.85, 1.15]
+      a_max: [0.85, 1.15]
+      tire_p_dx1: [0.75, 1.25]
+      tire_p_dy1: [0.75, 1.25]
+      tire_p_kx1: [0.75, 1.25]
+      tire_p_ky1: [0.75, 1.25]
+  num_epochs: 4
   discounting: 0.99
   gae_lambda: 0.95
-  clipping_epsilon: 0.2
-  entropy_cost: 0.01
+  clipping_epsilon: 0.15
+  entropy_cost: 0.0
   value_cost: 0.5
   normalize_advantage: true
   sampler_update_freq: 1
   gmm_components: 20
-  gmm_target_beta: -8
+  gmm_target_beta: -20
   gmm_init_std: 0.1
+  # Current comparison uses reward-only GMMVI, which performed best with the
+  # binary collision constraint. The cost formulation remains selectable from
+  # the CLI for ablations.
+  gmm_formulation: reward
+  gmm_reward_fraction: 1.0
+  gmm_reward_kl_radius: 0.1
+  gmm_reward_dual_lr: 0.001
+  gmm_cost_initial_beta: 1.0
+  gmm_cost_dual_lr: 0.5
+  gmm_dual_ema_decay: 0.9
+  gmm_cost_dual_ema_decay: 0.5  # faster cost-beta response; reward EMA remains 0.9
+  gmm_dual_lambda_min: 0.001
+  gmm_dual_lambda_max: 1000.0
+  gmm_reward_violation_clip: 0.025  # 25% of KL radius
+  gmm_cost_violation_clip: 0.05     # cap at one collision-budget unit per update
+  # Hybrid safety objective: the dense edge penalty remains reward shaping,
+  # while PPO-Lag and cost GMMVI use a binary terminal-boundary collision.
+  # A 0.30 episodic budget targets at most a 30% collision probability in eval.
+  # This is an intermediate feasible target before tightening the constraint.
+  use_ppo_lag: true
+  constraint_cost_type: collision
+  safety_bound: 0.30
+  lagrangian_coef_rate: 1.0
+  initial_lambda_lagr: 1.0
+  cost_critic_layer: [256, 256, 256, 256, 256]

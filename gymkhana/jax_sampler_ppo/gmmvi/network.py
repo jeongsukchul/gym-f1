@@ -42,7 +42,6 @@ class GMMNetwork(NamedTuple):
 def create_gmm_network_and_state(
     dim : int,
     num_envs : int,
-    batch_size : int,
     key : jax.random.PRNGKey,
     prior_mean : float = 0.,
     prior_scale : float = .3,
@@ -50,7 +49,7 @@ def create_gmm_network_and_state(
     max_components : int | None = None,
     num_initial_components : int | None = None,
 ):  
-    
+    print("gmmvi num envs", num_envs)
     max_components = int(cfg.max_components if max_components is None else max_components)
     num_initial_components = int(
         cfg.num_initial_components if num_initial_components is None else num_initial_components
@@ -73,7 +72,7 @@ def create_gmm_network_and_state(
                             cfg.max_database_size,
                             max_components,
                             cfg.use_diagonal_convs,
-                            batch_size,
+                            num_envs,
                             num_envs,
                             inv_bijector=model.inv_bijector)
     sample_db_state = sample_db.init_sampleDB_state()
@@ -105,7 +104,7 @@ def create_gmm_network_and_state(
     sample_selector = setup_fixed_sample_selector(sample_db,
                                                     model,
                                                     num_envs,
-                                                    batch_size)
+                                                    num_envs)
     # 'R' Adaptive Component Stepsize update
     component_stepsize_fn = functools.partial(update_component_stepsize_adaptive, 
                                                 MIN_STEPSIZE=cfg.min_stepsize,               

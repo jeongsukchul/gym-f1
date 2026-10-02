@@ -31,9 +31,9 @@ class JaxRaceEnv:
 
     This first backend mirrors the current drift/race training path:
     STD dynamics, normalized ``[steering_angle, speed]`` actions,
-    centerline Frenet boundary checking, progress reward, and ``drift_real``
-    vector observations. Rendering, LiDAR, recovery mode, and Gym spaces are
-    intentionally absent.
+    centerline Frenet boundary checking, progress reward with dense
+    near-boundary shaping, and ``drift_real`` vector observations.
+    Rendering, LiDAR, recovery mode, and Gym spaces are intentionally absent.
     """
 
     def __init__(
@@ -58,6 +58,9 @@ class JaxRaceEnv:
         slip_reward_target_deg: float = 45.0,
         slip_reward_width_deg: float = 20.0,
         slip_reward_shape: float = 2.5,
+        edge_penalty_weight: float = 1.0,
+        edge_penalty_start_ratio: float = 0.8,
+        termination_boundary_margin_ratio: float = 1.0,
         sensor_noise_enabled: bool = False,
         sensor_noise_s_std: float = 0.0,
         sensor_noise_n_std: float = 0.0,
@@ -83,10 +86,17 @@ class JaxRaceEnv:
         self.slip_reward_target_deg = float(slip_reward_target_deg)
         self.slip_reward_width_deg = float(slip_reward_width_deg)
         self.slip_reward_shape = float(slip_reward_shape)
+        self.edge_penalty_weight = float(edge_penalty_weight)
+        self.edge_penalty_start_ratio = float(edge_penalty_start_ratio)
+        self.termination_boundary_margin_ratio = float(termination_boundary_margin_ratio)
         self.sensor_noise_enabled = bool(sensor_noise_enabled)
         self.sensor_noise_s_std = float(sensor_noise_s_std)
         self.sensor_noise_n_std = float(sensor_noise_n_std)
         self.sensor_noise_psi_std = float(sensor_noise_psi_std)
+        if self.termination_boundary_margin_ratio < 1.0:
+            raise ValueError(
+                "termination_boundary_margin_ratio must be >= 1.0 so termination does not happen inside the track."
+            )
 
     @classmethod
     def from_track_name(cls, track_name: str = "Drift", *, reversed: bool = False, **kwargs) -> "JaxRaceEnv":
@@ -122,9 +132,12 @@ class JaxRaceEnv:
 
         s, ey, _, idx = frenet
         widths = self.track.widths[idx % self.track.widths.shape[0]]
-        boundary = jnp.abs(ey) > 0.5 * widths
+        half_width = 0.5 * widths
+        boundary = jnp.abs(ey) > half_width
+        edge_proximity, edge_cost = self._edge_cost_from_lateral_error(ey, half_width)
+        terminal_boundary = edge_proximity > self.termination_boundary_margin_ratio
+        collision_cost = terminal_boundary.astype(jnp.float32)
         progress = self._correct_wraparound_progress(s - state.last_s)
-        vx = x_next[..., 3] * jnp.cos(x_next[..., 6])
         path_reward = progress * self.progress_gain
         slip_angle_abs_deg = jnp.abs(x_next[..., 6]) * (180.0 / jnp.pi)
         slip_reward_raw = self._slip_reward_raw_from_abs_deg(slip_angle_abs_deg)
@@ -134,12 +147,13 @@ class JaxRaceEnv:
             self.slip_reward_path_weight * path_reward + slip_reward,
             path_reward,
         )
-        # reward = jnp.where(boundary, self.out_of_bounds_penalty, shaped_reward)
-        # reward = reward + jnp.where(vx < 0.0, self.negative_vel_penalty, 0.0)
+        reward = reward - edge_cost
+        # reward = jnp.where(boundary, self.out_of_bounds_penalty, reward)
+        # reward = reward + jnp.where(x_next[..., 3] * jnp.cos(x_next[..., 6]) < 0.0, self.negative_vel_penalty, 0.0)
 
         step_count = state.step_count + 1
         truncated = step_count > self.max_episode_steps
-        done = boundary | truncated
+        done = terminal_boundary | truncated
         next_state = EnvState(x=x_next, last_s=s, step_count=step_count, steer_buffer=new_buffer)
 
         if auto_reset and key is not None:
@@ -163,8 +177,12 @@ class JaxRaceEnv:
                 "s": s,
                 "ey": ey,
                 "boundary": boundary,
+                "terminal_boundary": terminal_boundary,
+                "collision_cost": collision_cost,
                 "truncated": truncated,
                 "path_reward": path_reward,
+                "edge_proximity": edge_proximity,
+                "edge_cost": edge_cost,
                 "slip_angle_abs_deg": slip_angle_abs_deg,
                 "slip_reward_raw": slip_reward_raw,
                 "slip_reward": slip_reward,
@@ -234,6 +252,12 @@ class JaxRaceEnv:
     def _slip_reward_raw_from_abs_deg(self, slip_angle_abs_deg):
         normalized_error = jnp.abs((slip_angle_abs_deg - self.slip_reward_target_deg) / self.slip_reward_width_deg)
         return 1.0 / (1.0 + normalized_error ** (2.0 * self.slip_reward_shape))
+
+    def _edge_cost_from_lateral_error(self, ey, half_width):
+        edge_proximity = jnp.abs(ey) / (half_width + 1e-6)
+        edge_margin = jnp.maximum(edge_proximity - self.edge_penalty_start_ratio, 0.0)
+        edge_cost = self.edge_penalty_weight * jnp.square(edge_margin)
+        return edge_proximity, edge_cost
 
     def _apply_sensor_noise(self, s, ey, ephi, key):
         if not self.sensor_noise_enabled or key is None:

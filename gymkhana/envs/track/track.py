@@ -10,7 +10,6 @@ import numpy as np
 import yaml
 from PIL import Image
 from PIL.Image import Transpose
-from yamldataclassconfig.config import YamlDataClassConfig
 
 from ..rendering import EnvRenderer
 from . import Raceline
@@ -19,7 +18,7 @@ from .track_utils import find_track_dir
 
 
 @dataclass
-class TrackSpec(YamlDataClassConfig):
+class TrackSpec:
     """Track metadata loaded from a ROS-format YAML map file."""
 
     name: Optional[str]

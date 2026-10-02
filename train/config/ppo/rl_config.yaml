@@ -1,0 +1,39 @@
+# Gym + Stable-Baselines3 PPO only. Legacy values preserved.
+seed: 1
+
+eval_seed: 1000
+
+core_mult: 2  # n_envs = core_mult * [# of CPU cores]
+              # experimentally, the ideal number of envs was found to be 2 x [# of CPU cores]
+
+total_timesteps: 200000000
+
+rollout_length: 1024  # Environment steps per environment per PPO rollout.
+
+batch_size: 8192  # PPO minibatch size; larger batches reduce optimizer overhead with many envs
+
+start_learning_rate: 1e-4 # initial learning rate
+
+end_learning_rate: 5e-5 # final learning rate, with linear decay
+
+act_func_neg_slope: 0.2  # actor, critic LeakyReLU negative slope
+
+use_custom_relu: false   # if true, use LeakyReLU (with act_func_neg_slope) instead of default Tanh
+
+actor_layer: [256, 256, 256]   # hidden layer sizes for actor (pi) network
+
+critic_layer: [256, 256, 256]  # hidden layer sizes for critic (vf) network
+
+actor_layer_norm: false        # apply LayerNorm after each actor hidden layer
+
+critic_layer_norm: true       # apply LayerNorm after each critic hidden layer
+
+log_std_schedule:
+  init: -.4    # σ ≈ 0.37
+  end: -.4     # σ ≈ 0.05
+
+additional_timesteps: 100000000  # additional timesteps for transfer/continue training
+
+transfer_reset_log_std: -0.5  # reset log_std to this value; use null to skip reset
+
+transfer_reset_critic: true  # reinitialize critic to random weights

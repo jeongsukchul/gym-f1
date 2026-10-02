@@ -13,7 +13,13 @@ After running, copy the printed values into gymkhana/envs/utils.py:
     GLOBAL_MAX_WIDTH
 """
 
+import sys
 from pathlib import Path
+
+if __package__ in (None, ""):
+    repo_root = str(Path(__file__).resolve().parents[1])
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
 
 from train.train_utils import compute_global_track_bounds
 

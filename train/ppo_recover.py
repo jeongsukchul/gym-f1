@@ -26,6 +26,14 @@ Usage:
     python train/ppo_recover.py --m f --path /path/to/racing_model.zip --reset_log_std none
 """
 
+import sys
+from pathlib import Path
+
+if __package__ in (None, ""):
+    repo_root = str(Path(__file__).resolve().parents[1])
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+
 from train.config.env_config import (
     RECOVERY_PROJECT_NAME,
     RECOVERY_TRACK_POOL,

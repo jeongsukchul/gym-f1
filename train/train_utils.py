@@ -516,7 +516,7 @@ def extract_rl_config(model: object, total_timesteps: int, n_envs: int) -> dict:
         Dictionary containing RL hyperparameters
     """
     config = {
-        "n_steps": model.n_steps,
+        "rollout_length": model.n_steps,
         "batch_size": model.batch_size,
         "gamma": model.gamma,
         "seed": model.seed,
@@ -537,12 +537,12 @@ def extract_rl_config(model: object, total_timesteps: int, n_envs: int) -> dict:
     # Read layer sizes from the model's policy
     net_arch = model.policy.net_arch
     if isinstance(net_arch, dict):
-        config["actor_layer_size"] = net_arch.get("pi", [])
-        config["critic_layer_size"] = net_arch.get("vf", [])
+        config["actor_layer"] = list(net_arch.get("pi", []))
+        config["critic_layer"] = list(net_arch.get("vf", []))
     else:
         # Shared architecture (list) — same for actor and critic
-        config["actor_layer_size"] = net_arch
-        config["critic_layer_size"] = net_arch
+        config["actor_layer"] = list(net_arch)
+        config["critic_layer"] = list(net_arch)
 
     # Record the policy's initial log_std (set via policy_kwargs at construction).
     # The schedule's end value lives in rl_config.yaml; init is the more meaningful

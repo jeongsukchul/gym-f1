@@ -14,6 +14,7 @@ from flax import linen as nn
 class SamplerPPONetworkParams:
     policy: object
     value: object
+    cost_value: object
 
 
 class GaussianPolicy(nn.Module):
@@ -21,17 +22,20 @@ class GaussianPolicy(nn.Module):
     hidden_layer_sizes: Sequence[int] = (64, 64)
     activation: Callable = nn.tanh
     init_log_std: float = -1.0
+    use_layer_norm: bool = False
 
     @nn.compact
     def __call__(self, obs):
         x = obs
         for size in self.hidden_layer_sizes:
             x = nn.Dense(size)(x)
+            if self.use_layer_norm:
+                x = nn.LayerNorm()(x)
             x = self.activation(x)
         mean = nn.Dense(self.action_size)(x)
         log_std = self.param(
             "log_std",
-            lambda key, shape: jnp.full(shape, self.init_log_std),
+            lambda key, shape: jnp.full(shape, self.init_log_std, dtype=jnp.float32),
             (self.action_size,),
         )
         log_std = jnp.clip(log_std, -5.0, 2.0)
@@ -41,12 +45,15 @@ class GaussianPolicy(nn.Module):
 class ValueNetwork(nn.Module):
     hidden_layer_sizes: Sequence[int] = (64, 64)
     activation: Callable = nn.tanh
+    use_layer_norm: bool = False
 
     @nn.compact
     def __call__(self, obs):
         x = obs
         for size in self.hidden_layer_sizes:
             x = nn.Dense(size)(x)
+            if self.use_layer_norm:
+                x = nn.LayerNorm()(x)
             x = self.activation(x)
         return jnp.squeeze(nn.Dense(1)(x), axis=-1)
 
@@ -54,6 +61,7 @@ class ValueNetwork(nn.Module):
 class SamplerPPONetworks(NamedTuple):
     policy_network: GaussianPolicy
     value_network: ValueNetwork
+    cost_value_network: ValueNetwork
 
 
 def normal_tanh_log_prob(mean: jax.Array, log_std: jax.Array, raw_action: jax.Array) -> jax.Array:
@@ -95,16 +103,29 @@ def make_sampler_ppo_networks(
     value_observation_size: int | None = None,
     policy_hidden_layer_sizes: Sequence[int] = (64, 64),
     value_hidden_layer_sizes: Sequence[int] = (64, 64),
+    cost_value_hidden_layer_sizes: Sequence[int] | None = None,
+    policy_use_layer_norm: bool = False,
+    value_use_layer_norm: bool = False,
     init_log_std: float = -1.0,
 ) -> SamplerPPONetworks:
     del observation_size, value_observation_size
+    if cost_value_hidden_layer_sizes is None:
+        cost_value_hidden_layer_sizes = value_hidden_layer_sizes
     return SamplerPPONetworks(
         policy_network=GaussianPolicy(
             action_size=action_size,
             hidden_layer_sizes=tuple(policy_hidden_layer_sizes),
+            use_layer_norm=policy_use_layer_norm,
             init_log_std=init_log_std,
         ),
-        value_network=ValueNetwork(hidden_layer_sizes=tuple(value_hidden_layer_sizes)),
+        value_network=ValueNetwork(
+            hidden_layer_sizes=tuple(value_hidden_layer_sizes),
+            use_layer_norm=value_use_layer_norm,
+        ),
+        cost_value_network=ValueNetwork(
+            hidden_layer_sizes=tuple(cost_value_hidden_layer_sizes),
+            use_layer_norm=value_use_layer_norm,
+        ),
     )
 
 
@@ -114,7 +135,7 @@ def init_network_params(
     actor_observation_size: int,
     value_observation_size: int | None = None,
 ) -> SamplerPPONetworkParams:
-    key_policy, key_value = jax.random.split(key)
+    key_policy, key_value, key_cost_value = jax.random.split(key, 3)
     if value_observation_size is None:
         value_observation_size = actor_observation_size
     dummy_actor_obs = jnp.zeros((1, actor_observation_size), dtype=jnp.float32)
@@ -122,6 +143,7 @@ def init_network_params(
     return SamplerPPONetworkParams(
         policy=networks.policy_network.init(key_policy, dummy_actor_obs),
         value=networks.value_network.init(key_value, dummy_value_obs),
+        cost_value=networks.cost_value_network.init(key_cost_value, dummy_value_obs),
     )
 
 

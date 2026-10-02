@@ -17,6 +17,7 @@ from gymkhana.jax_env import JaxRaceEnv
 from gymkhana.jax_sampler_ppo import (
     BoundedGMMVISampler,
     F1TenthAdvWrapper,
+    RewardCostGMMVISampler,
     SamplerPPOConfig,
     SamplerPPOTrainer,
     UniformDRSampler,
@@ -27,12 +28,23 @@ from gymkhana.jax_sampler_ppo import (
     record_policy_trajectory,
 )
 from gymkhana.jax_sampler_ppo.evaluator import generate_adv_unroll
+from gymkhana.jax_sampler_ppo.dual_optimization import (
+    cost_beta_from_dual,
+    projected_dual_ascent,
+    reward_beta_from_dual,
+)
 from gymkhana.jax_sampler_ppo.networks import sample_action
-from train.jax_sampler_ppo import _evaluation_schedule, _make_eval_fn, _save_eval_render, _track_boundary_lines
+from train.jax_sampler_ppo import (
+    _apply_scoped_output_dirs,
+    _evaluation_schedule,
+    _make_eval_fn,
+    _save_eval_render,
+    _track_boundary_lines,
+)
 
 
 def _domain_ranges_from_config():
-    with (Path(__file__).resolve().parents[1] / "train/config/rl_config.yaml").open("r") as f:
+    with (Path(__file__).resolve().parents[1] / "train/config/jax/rl_config.yaml").open("r") as f:
         config = yaml.safe_load(f)
     return config["jax_sampler_ppo"]["domain_randomization_ranges"]
 
@@ -157,6 +169,104 @@ def test_uniform_dr_sampler_samples_inside_domain_and_updates():
     )
 
 
+def test_reward_cost_gmmvi_updates_independent_duals_from_kl_and_budget():
+    spec = _domain_spec_from_config()
+    sampler = RewardCostGMMVISampler(
+        spec.low,
+        spec.high,
+        num_components=2,
+        init_std=0.1,
+        num_envs=8,
+        reward_initial_beta=-20.0,
+        reward_kl_radius=0.1,
+        reward_dual_lr=1e-3,
+        cost_initial_beta=1.0,
+        cost_budget=2.0,
+        cost_dual_lr=1e-2,
+        dual_ema_decay=0.9,
+    )
+    state = sampler.init(jax.random.PRNGKey(30), spec.nominal_vector)
+    samples, _, component_ids = sampler.sample(state, jax.random.PRNGKey(31), 8)
+    reward_scores = jnp.linspace(0.0, 1.0, 8)
+    cost_scores = jnp.full((8,), 3.0)
+
+    update = sampler.update(
+        state,
+        samples,
+        reward_scores,
+        component_ids,
+        jax.random.PRNGKey(32),
+        cost_scores=cost_scores,
+    )
+
+    assert update.state.num_updates == 1
+    assert jnp.isfinite(update.metrics["sampler/reward_beta"])
+    assert jnp.isfinite(update.metrics["sampler/reward_kl_to_uniform"])
+    assert update.metrics["sampler/cost_mean"] == pytest.approx(3.0)
+    assert update.metrics["sampler/cost_budget_violation"] > 0.0
+    assert update.metrics["sampler/cost_beta"] > 1.0
+
+
+def test_signed_inverse_temperatures_follow_projected_dual():
+    updated, violation = projected_dual_ascent(
+        0.5,
+        constraint_value=0.3,
+        constraint_limit=0.1,
+        learning_rate=0.5,
+        min_dual=0.01,
+        max_dual=10.0,
+    )
+    np.testing.assert_allclose(updated, 0.6)
+    np.testing.assert_allclose(violation, 0.2)
+    np.testing.assert_allclose(reward_beta_from_dual(updated), -1.0 / 0.6)
+    np.testing.assert_allclose(cost_beta_from_dual(updated), 1.0 / 0.6)
+
+
+@pytest.mark.parametrize("reward_fraction", [0.0, 0.5])
+def test_cost_sampler_scaling_changes_target_but_preserves_raw_dual(reward_fraction):
+    sampler = RewardCostGMMVISampler(
+        jnp.asarray([0.5, 0.5]), jnp.asarray([1.5, 1.5]),
+        num_components=2, init_std=0.1, num_envs=4,
+        reward_fraction=reward_fraction, cost_budget=0.05,
+        cost_dual_lr=0.1, cost_score_scale=20.0,
+    )
+    state = sampler.init(jax.random.PRNGKey(1))
+    samples, _, ids = sampler.sample(state, jax.random.PRNGKey(2), 4)
+    update = sampler.update(
+        state, samples, jnp.ones(4), ids, jax.random.PRNGKey(3),
+        cost_scores=jnp.asarray([0.0, 1.0, 0.0, 1.0]),
+    )
+    assert update.metrics["sampler/cost_mean"] == pytest.approx(0.5)
+    assert update.metrics["sampler/cost_scaled_mean"] == pytest.approx(10.0)
+    assert update.metrics["sampler/cost_scaled_budget"] == pytest.approx(1.0)
+    assert update.metrics["sampler/cost_target_logpdf_mean"] == pytest.approx(10.0)
+    assert update.state.cost_dual_lambda == pytest.approx(0.9955)
+
+
+@pytest.mark.parametrize("mode", ["linear", "log"])
+@pytest.mark.parametrize("reward_fraction", [0.0, 0.5])
+@pytest.mark.parametrize("cost", [0.0, 1.0])
+def test_adversarial_cost_beta_follows_budget_violation(mode, reward_fraction, cost):
+    sampler = RewardCostGMMVISampler(
+        jnp.asarray([0.5, 0.5]), jnp.asarray([1.5, 1.5]),
+        num_components=2, init_std=0.1, num_envs=4,
+        reward_fraction=reward_fraction, cost_budget=0.05,
+        cost_dual_lr=0.5, cost_dual_ema_decay=0.5,
+        cost_violation_clip=0.05, cost_dual_update=mode,
+    )
+    state = sampler.init(jax.random.PRNGKey(1))
+    samples, _, ids = sampler.sample(state, jax.random.PRNGKey(2), 4)
+    result = jax.jit(lambda st: sampler.update(
+        st, samples, jnp.ones(4), ids, jax.random.PRNGKey(3),
+        cost_scores=jnp.full((4,), cost),
+    ))(state)
+    violation = float(result.metrics["sampler/cost_budget_violation"])
+    expected_dual = (np.exp(-0.5 * violation) if mode == "log"
+                     else 1.0 - 0.5 * violation)
+    np.testing.assert_allclose(result.state.cost_dual_lambda, expected_dual, rtol=1e-5)
+    assert (float(result.metrics["sampler/cost_beta"]) > 1.0) == (cost > 0.05)
+
+
 def test_num_evals_schedule_matches_total_eval_semantics():
     run_initial, eval_updates = _evaluation_schedule(num_updates=100, num_evals=5)
     assert run_initial
@@ -169,6 +279,25 @@ def test_num_evals_schedule_matches_total_eval_semantics():
     run_initial, eval_updates = _evaluation_schedule(num_updates=0, num_evals=3)
     assert run_initial
     assert eval_updates == set()
+
+
+def test_scoped_output_dirs_include_sampler_seed_and_run():
+    rl_config = {
+        "seed": 3,
+        "jax_sampler_ppo": {
+            "sampler": "gmmvi",
+            "sampler_plot_dir": "outputs/jax_sampler_ppo/sampler_plots",
+            "eval_render_dir": "outputs/jax_sampler_ppo/eval_renders",
+            "eval_video_dir": "outputs/jax_sampler_ppo/eval_videos",
+        },
+    }
+
+    _apply_scoped_output_dirs(rl_config, run_label="run_test123")
+
+    jax_config = rl_config["jax_sampler_ppo"]
+    assert jax_config["sampler_plot_dir"] == "outputs/jax_sampler_ppo/gmmvi/seed_3/run_test123/sampler_plots"
+    assert jax_config["eval_render_dir"] == "outputs/jax_sampler_ppo/gmmvi/seed_3/run_test123/eval_renders"
+    assert jax_config["eval_video_dir"] == "outputs/jax_sampler_ppo/gmmvi/seed_3/run_test123/eval_videos"
 
 
 def test_sampler_ppo_training_step_is_jittable():
@@ -201,6 +330,75 @@ def test_sampler_ppo_training_step_is_jittable():
     assert jnp.all(state.sampler_state.num_updates == 1)
 
 
+def test_ppo_lagrange_training_step_has_cost_critic_and_multiplier_metrics():
+    base_env = JaxRaceEnv.from_track_name(
+        "Drift",
+        batch_size=4,
+        max_episode_steps=16,
+        edge_penalty_start_ratio=0.0,
+    )
+    wrapper = F1TenthAdvWrapper(base_env, _domain_spec_from_config())
+    config = SamplerPPOConfig(
+        sampler="uniform",
+        unroll_length=2,
+        batch_size=4,
+        num_epochs=1,
+        policy_hidden_layer_sizes=(16,),
+        value_hidden_layer_sizes=(16,),
+        cost_value_hidden_layer_sizes=(16,),
+        use_ppo_lag=True,
+        safety_bound=0.0,
+        lagrangian_coef_rate=0.1,
+    )
+    trainer = SamplerPPOTrainer(wrapper, config)
+    state = trainer.init_state(jax.random.PRNGKey(24))
+
+    state, metrics = jax.jit(trainer.training_step)(state)
+
+    assert jnp.isfinite(metrics["loss/cost_value"])
+    assert jnp.isfinite(metrics["constraint/mean_cost"])
+    assert jnp.isfinite(metrics["constraint/lambda_lagr"])
+    assert jnp.isfinite(metrics["constraint/cost_violation"])
+    assert jnp.isfinite(metrics["training/reward/rollout_return_mean"])
+    assert jnp.isfinite(metrics["training/cost/signed_violation_mean"])
+    assert jnp.isfinite(metrics["training/cost/violation_rate"])
+    assert metrics["training/cost/episode_budget"] == pytest.approx(0.0)
+    assert state.params.cost_value is not None
+
+
+def test_reward_cost_gmmvi_training_step_is_jittable():
+    base_env = JaxRaceEnv.from_track_name(
+        "Drift",
+        batch_size=4,
+        max_episode_steps=16,
+        edge_penalty_start_ratio=0.0,
+    )
+    wrapper = F1TenthAdvWrapper(base_env, _domain_spec_from_config())
+    config = SamplerPPOConfig(
+        sampler="reward_cost_gmmvi",
+        unroll_length=2,
+        batch_size=4,
+        num_epochs=1,
+        gmm_components=2,
+        policy_hidden_layer_sizes=(16,),
+        value_hidden_layer_sizes=(16,),
+        cost_value_hidden_layer_sizes=(16,),
+        use_ppo_lag=True,
+        safety_bound=2.0,
+    )
+    trainer = SamplerPPOTrainer(wrapper, config)
+    state = trainer.init_state(jax.random.PRNGKey(33))
+
+    state, metrics = jax.jit(trainer.training_step)(state)
+
+    assert state.sampler_state.num_updates == 1
+    assert jnp.isfinite(metrics["sampler/reward_beta"])
+    assert jnp.isfinite(metrics["sampler/cost_beta"])
+    assert jnp.isfinite(metrics["sampler/reward_kl_to_uniform"])
+    assert jnp.isfinite(metrics["sampler/cost_budget_violation"])
+    assert metrics["sampler/cost_budget"] == pytest.approx(0.25)
+
+
 def test_policy_repeat_steps_hold_action_across_physics_steps():
     base_env = JaxRaceEnv.from_track_name("Drift", batch_size=4, max_episode_steps=32)
     wrapper = F1TenthAdvWrapper(base_env, _domain_spec_from_config(), action_repeat_steps=2)
@@ -225,6 +423,25 @@ def test_policy_repeat_steps_hold_action_across_physics_steps():
 
     assert data.action.shape == (2, 4, 2)
     np.testing.assert_array_equal(np.asarray(final_state.env_state.step_count), np.full((4,), 4))
+
+
+def test_collision_constraint_selects_binary_terminal_cost():
+    base_env = JaxRaceEnv.from_track_name("Drift", batch_size=2, max_episode_steps=16)
+    wrapper = F1TenthAdvWrapper(
+        base_env,
+        _domain_spec_from_config(),
+        constraint_cost_type="collision",
+    )
+    like = jnp.zeros((2,), dtype=jnp.float32)
+    metrics = {
+        "edge_cost": jnp.asarray([0.25, 0.5], dtype=jnp.float32),
+        "collision_cost": jnp.asarray([0.0, 1.0], dtype=jnp.float32),
+    }
+
+    np.testing.assert_array_equal(
+        np.asarray(wrapper.constraint_cost(metrics, like)),
+        np.asarray([0.0, 1.0], dtype=np.float32),
+    )
 
 
 def test_asymmetric_value_obs_uses_actor_history_plus_domain_params():
@@ -439,6 +656,7 @@ def test_jax_evaluation_runs_one_episode_per_eval_env():
         jax.random.PRNGKey(6),
         wrapper.nominal_dynamics_params,
         episode_length=8,
+        safety_bound=2.0,
     )
 
     assert result.rewards.shape == (eval_envs,)
@@ -446,6 +664,14 @@ def test_jax_evaluation_runs_one_episode_per_eval_env():
     assert jnp.isfinite(result.metrics["eval/episode_reward_mean"])
     assert jnp.isfinite(result.metrics["eval/episode_reward_p5"])
     assert jnp.isfinite(result.metrics["eval/episode_reward_p95"])
+    assert jnp.isfinite(result.metrics["evaluation/reward/episode_return_mean"])
+    assert jnp.isfinite(result.metrics["evaluation/cost/episode_cost_mean"])
+    assert jnp.isfinite(result.metrics["evaluation/cost/signed_violation_mean"])
+    assert jnp.isfinite(result.metrics["evaluation/cost/violation_rate"])
+    assert jnp.isfinite(result.metrics["evaluation/cost/mean_budget_margin"])
+    assert jnp.isfinite(result.metrics["evaluation/cost/mean_constraint_satisfied"])
+    assert jnp.isfinite(result.metrics["evaluation/edge/episode_penalty_mean"])
+    assert jnp.isfinite(result.metrics["evaluation/collision/rate"])
 
 
 def test_jax_eval_fn_repeats_episodes_per_selected_dynamics():
@@ -488,6 +714,22 @@ def test_jax_eval_fn_repeats_episodes_per_selected_dynamics():
         rtol=1e-6,
         atol=1e-6,
     )
+
+
+def test_log_dual_preserves_relative_beta_change_and_bounds():
+    from gymkhana.jax_sampler_ppo.dual_optimization import projected_log_dual_ascent
+
+    update = jax.jit(projected_log_dual_ascent)
+    for dual in (1.0, 100.0):
+        next_dual, violation = update(dual, 0.5, 0.05, 0.5, 0.001, 1000.0, 0.05)
+        np.testing.assert_allclose(violation, 0.05, rtol=1e-6)
+        np.testing.assert_allclose(dual / next_dual, np.exp(-0.025), rtol=1e-5)
+    next_dual, _ = update(1.0, 0.0, 0.05, 0.5, 0.001, 1000.0, 0.05)
+    assert float(next_dual) < 1.0  # beta increases below budget
+    for dual in (0.001, 1000.0):
+        for cost in (0.0, 1.0):
+            next_dual, _ = update(dual, cost, 0.05, 1e6, 0.001, 1000.0, 0.05)
+            assert 0.001 - 1e-8 <= float(next_dual) <= 1000.0
 
 
 def test_jax_policy_export_onnx_matches_existing_runner(tmp_path):

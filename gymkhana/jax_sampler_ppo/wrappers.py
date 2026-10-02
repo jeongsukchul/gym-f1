@@ -47,6 +47,7 @@ class F1TenthAdvWrapper:
         obs_delay_max_steps: int | None = None,
         asymmetric_critic: bool = False,
         action_repeat_steps: int = 1,
+        constraint_cost_type: str = "edge",
     ):
         self.env = env
         self.domain_spec = domain_spec
@@ -59,6 +60,7 @@ class F1TenthAdvWrapper:
         self.obs_history_buffer_len = self.obs_history_len + self.obs_delay_max_steps
         self.asymmetric_critic = bool(asymmetric_critic)
         self.action_repeat_steps = int(action_repeat_steps)
+        self.constraint_cost_type = str(constraint_cost_type).lower()
         if self.obs_history_len < 1:
             raise ValueError(f"obs_history_len must be >= 1, got {obs_history_len}")
         if self.obs_delay_min_steps < 0:
@@ -70,6 +72,11 @@ class F1TenthAdvWrapper:
             )
         if self.action_repeat_steps < 1:
             raise ValueError(f"action_repeat_steps must be >= 1, got {action_repeat_steps}")
+        if self.constraint_cost_type not in {"edge", "collision"}:
+            raise ValueError(
+                "constraint_cost_type must be one of: edge, collision; "
+                f"got {constraint_cost_type!r}"
+            )
         self.batch_size = env.batch_size
         self.base_observation_size = 7 + env.lookahead_n_points + (2 if env.sparse_width_obs else env.lookahead_n_points)
         self.actor_observation_size = self.base_observation_size * self.obs_history_len
@@ -79,6 +86,14 @@ class F1TenthAdvWrapper:
         self.observation_size = self.actor_observation_size
         self.action_size = 2
         self.dynamics_param_size = domain_spec.size
+
+    @property
+    def constraint_cost_metric(self) -> str:
+        return "collision_cost" if self.constraint_cost_type == "collision" else "edge_cost"
+
+    def constraint_cost(self, metrics: dict[str, Any], like: jax.Array) -> jax.Array:
+        """Return the configured PPO-Lagrange cost from environment metrics."""
+        return metrics.get(self.constraint_cost_metric, jnp.zeros_like(like))
 
     @property
     def nominal_dynamics_params(self) -> jax.Array:
@@ -137,12 +152,16 @@ class F1TenthAdvWrapper:
         done = jnp.zeros((self.batch_size,), dtype=bool)
         count = jnp.zeros((self.batch_size,), dtype=jnp.float32)
         boundary = jnp.zeros((self.batch_size,), dtype=bool)
+        terminal_boundary = jnp.zeros((self.batch_size,), dtype=bool)
         truncated = jnp.zeros((self.batch_size,), dtype=bool)
         zero_bool = jnp.zeros((self.batch_size,), dtype=bool)
         zero_metric = jnp.zeros((self.batch_size,), dtype=jnp.float32)
         s = jnp.zeros((self.batch_size,), dtype=jnp.float32)
         ey = jnp.zeros((self.batch_size,), dtype=jnp.float32)
         path_reward = jnp.zeros((self.batch_size,), dtype=jnp.float32)
+        edge_proximity = jnp.zeros((self.batch_size,), dtype=jnp.float32)
+        edge_cost = jnp.zeros((self.batch_size,), dtype=jnp.float32)
+        collision_cost = jnp.zeros((self.batch_size,), dtype=jnp.float32)
         slip_angle_abs_deg = jnp.zeros((self.batch_size,), dtype=jnp.float32)
         slip_reward_raw = jnp.zeros((self.batch_size,), dtype=jnp.float32)
         slip_reward = jnp.zeros((self.batch_size,), dtype=jnp.float32)
@@ -166,8 +185,12 @@ class F1TenthAdvWrapper:
             s = jnp.where(active, out.metrics.get("s", zero_metric), s)
             ey = jnp.where(active, out.metrics.get("ey", zero_metric), ey)
             boundary = boundary | (active & out.metrics.get("boundary", zero_bool))
+            terminal_boundary = terminal_boundary | (active & out.metrics.get("terminal_boundary", zero_bool))
             truncated = truncated | (active & out.metrics.get("truncated", zero_bool))
             path_reward = path_reward + out.metrics.get("path_reward", zero_metric) * active_f
+            edge_proximity = edge_proximity + out.metrics.get("edge_proximity", zero_metric) * active_f
+            edge_cost = edge_cost + out.metrics.get("edge_cost", zero_metric) * active_f
+            collision_cost = collision_cost + out.metrics.get("collision_cost", zero_metric) * active_f
             slip_angle_abs_deg = slip_angle_abs_deg + out.metrics.get("slip_angle_abs_deg", zero_metric) * active_f
             slip_reward_raw = slip_reward_raw + out.metrics.get("slip_reward_raw", zero_metric) * active_f
             slip_reward = slip_reward + out.metrics.get("slip_reward", zero_metric) * active_f
@@ -183,8 +206,12 @@ class F1TenthAdvWrapper:
                 "s": s,
                 "ey": ey,
                 "boundary": boundary,
+                "terminal_boundary": terminal_boundary,
                 "truncated": truncated,
                 "path_reward": path_reward,
+                "edge_proximity": edge_proximity / safe_count,
+                "edge_cost": edge_cost,
+                "collision_cost": collision_cost,
                 "slip_angle_abs_deg": slip_angle_abs_deg / safe_count,
                 "slip_reward_raw": slip_reward_raw / safe_count,
                 "slip_reward": slip_reward / safe_count,

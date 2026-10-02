@@ -19,6 +19,9 @@ slip_reward_slip_weight: 0.
 slip_reward_target_deg: 40.0
 slip_reward_width_deg: 15.0
 slip_reward_shape: 2.5
+edge_penalty_weight: 10.0
+edge_penalty_start_ratio: 0.8
+termination_boundary_margin_ratio: 1.2  # allow a small off-track buffer so hard DR degrades reward before resetting
 
 # LiDAR beams config - keep minimal for fast training, as it isn't needed
 num_beams: 2
@@ -28,9 +31,9 @@ map: "CircleDrift"
 # Multi-map training (optional)
 # If specified, parallel environments will train on different maps from this list
 # See /train/training_utils.py make_subprocvecenv
-track_pool:
-  - "Drift"
-  - "Drift_mirror"
+# track_pool:
+  # - "Drift"
+  # - "Drift_mirror"
   # - "Drift2"
   # - "Drift2_mirror"
 # For single-map training, set to null or comment out:
@@ -47,7 +50,7 @@ sparse_width_obs: true
 lookahead_n_points: 5
 lookahead_ds: 0.5
 normalize_obs: true
-mask_track_obs: true  # zero curvature/width lookahead channels for CircleDrift ablation
+mask_track_obs: false  # expose curvature and width lookahead to the actor
 obs_history_len: 6    # stack recent observations for dynamics/friction inference
 obs_delay_min_steps: 1  # per-episode UniformInt lower bound, in policy-observation steps
 obs_delay_max_steps: 3  # per-episode UniformInt upper bound, inclusive
@@ -57,7 +60,7 @@ sensor_noise_n_std: 0.005       # [m] lateral Frenet measurement noise before no
 sensor_noise_psi_std_deg: .5  # [deg] heading-error measurement noise before normalization
 
 # Reset configuration
-track_direction: "random"
+track_direction: "normal"
 prevent_instability: true # enables integration instability checking with reset
 dr_clip_k: 3.0
 steering_delay_steps: 2

@@ -30,6 +30,9 @@ class TrajectoryResult(NamedTuple):
 
 class _EvalEpisodeBatch(NamedTuple):
     rewards: jax.Array
+    costs: jax.Array
+    edge_costs: jax.Array
+    collision_counts: jax.Array
     lengths: jax.Array
     slip_angle_abs_deg: jax.Array
     slip_reward: jax.Array
@@ -66,6 +69,9 @@ def generate_adv_unroll(
                 "state_extras": {
                     "truncation": out.metrics.get("truncated", jnp.zeros_like(out.reward)),
                     "boundary": out.metrics.get("boundary", jnp.zeros_like(out.reward)),
+                    "cost": env.constraint_cost(out.metrics, out.reward),
+                    "edge_cost": out.metrics.get("edge_cost", jnp.zeros_like(out.reward)),
+                    "collision_cost": out.metrics.get("collision_cost", jnp.zeros_like(out.reward)),
                     "path_reward": out.metrics.get("path_reward", jnp.zeros_like(out.reward)),
                     "slip_angle_abs_deg": out.metrics.get("slip_angle_abs_deg", jnp.zeros_like(out.reward)),
                     "slip_reward_raw": out.metrics.get("slip_reward_raw", jnp.zeros_like(out.reward)),
@@ -81,12 +87,16 @@ def generate_adv_unroll(
 
 def _build_eval_metrics(
     rewards: jax.Array,
+    costs: jax.Array,
+    edge_costs: jax.Array,
+    collision_counts: jax.Array,
     lengths: jax.Array,
     slip_angle_abs_deg: jax.Array,
     slip_reward: jax.Array,
     *,
     dynamics_count: int,
     episodes_per_dynamics: int,
+    safety_bound: float | None,
 ) -> dict:
     rewards_sorted = jnp.sort(rewards)
     k10 = max(1, int(rewards.shape[0] * 0.1))
@@ -95,7 +105,45 @@ def _build_eval_metrics(
         f"eval/episode_reward_p{percentile}": jnp.percentile(rewards, percentile)
         for percentile in REWARD_PERCENTILES
     }
-    return {
+    cost_percentiles = {
+        f"evaluation/cost/episode_cost_p{percentile}": jnp.percentile(costs, percentile)
+        for percentile in (50, 90, 95, 99)
+    }
+    metrics = {
+        # Canonical W&B evaluation namespace.
+        "evaluation/reward/episode_return_mean": jnp.mean(rewards),
+        "evaluation/reward/episode_return_std": jnp.std(rewards),
+        "evaluation/reward/episode_return_min": jnp.min(rewards),
+        "evaluation/reward/episode_return_max": jnp.max(rewards),
+        "evaluation/reward/cvar10": jnp.mean(rewards_sorted[:k10]),
+        "evaluation/reward/cvar20": jnp.mean(rewards_sorted[:k20]),
+        **{
+            f"evaluation/reward/episode_return_p{percentile}": jnp.percentile(rewards, percentile)
+            for percentile in REWARD_PERCENTILES
+        },
+        "evaluation/cost/episode_cost_mean": jnp.mean(costs),
+        "evaluation/cost/episode_cost_std": jnp.std(costs),
+        "evaluation/cost/episode_cost_min": jnp.min(costs),
+        "evaluation/cost/episode_cost_max": jnp.max(costs),
+        **cost_percentiles,
+        "evaluation/edge/episode_penalty_mean": jnp.mean(edge_costs),
+        "evaluation/edge/episode_penalty_std": jnp.std(edge_costs),
+        "evaluation/edge/episode_penalty_max": jnp.max(edge_costs),
+        "evaluation/collision/episode_count_mean": jnp.mean(collision_counts),
+        "evaluation/collision/episode_count_max": jnp.max(collision_counts),
+        "evaluation/collision/rate": jnp.mean((collision_counts > 0.0).astype(jnp.float32)),
+        "evaluation/collision/collision_free_rate": jnp.mean(
+            (collision_counts == 0.0).astype(jnp.float32)
+        ),
+        "evaluation/episode/length_mean": jnp.mean(lengths),
+        "evaluation/episode/length_std": jnp.std(lengths),
+        "evaluation/behavior/slip_angle_abs_deg_mean": jnp.mean(slip_angle_abs_deg),
+        "evaluation/behavior/slip_reward_raw_mean": jnp.mean(slip_reward),
+        "evaluation/meta/dynamics_count": jnp.asarray(dynamics_count, dtype=jnp.float32),
+        "evaluation/meta/episodes_per_dynamics": jnp.asarray(episodes_per_dynamics, dtype=jnp.float32),
+        "evaluation/meta/total_episodes": jnp.asarray(rewards.shape[0], dtype=jnp.float32),
+        # Legacy in-process names retained for callers/tests; W&B filters these
+        # out whenever canonical evaluation/* keys are present.
         "eval/episode_reward_mean": jnp.mean(rewards),
         "eval/episode_reward_std": jnp.std(rewards),
         "eval/episode_reward_min": jnp.min(rewards),
@@ -111,6 +159,24 @@ def _build_eval_metrics(
         "eval/episodes_per_dynamics": jnp.asarray(episodes_per_dynamics, dtype=jnp.float32),
         "eval/total_episodes": jnp.asarray(rewards.shape[0], dtype=jnp.float32),
     }
+    if safety_bound is not None:
+        budget = jnp.asarray(safety_bound, dtype=jnp.float32)
+        violation = costs - budget
+        positive_violation = jnp.maximum(violation, 0.0)
+        metrics.update(
+            {
+                "evaluation/cost/episode_budget": budget,
+                "evaluation/cost/signed_violation_mean": jnp.mean(violation),
+                "evaluation/cost/positive_violation_mean": jnp.mean(positive_violation),
+                "evaluation/cost/violation_rate": jnp.mean((violation > 0.0).astype(jnp.float32)),
+                "evaluation/cost/satisfied_rate": jnp.mean((violation <= 0.0).astype(jnp.float32)),
+                "evaluation/cost/mean_budget_margin": budget - jnp.mean(costs),
+                "evaluation/cost/mean_constraint_satisfied": (
+                    jnp.mean(costs) <= budget
+                ).astype(jnp.float32),
+            }
+        )
+    return metrics
 
 
 def _evaluate_policy_episode_batch(
@@ -124,16 +190,37 @@ def _evaluate_policy_episode_batch(
     state = env.reset(key, dynamics_params)
     active = jnp.ones((env.batch_size,), dtype=jnp.float32)
     episode_reward = jnp.zeros((env.batch_size,), dtype=jnp.float32)
+    episode_cost = jnp.zeros((env.batch_size,), dtype=jnp.float32)
+    episode_edge_cost = jnp.zeros((env.batch_size,), dtype=jnp.float32)
+    episode_collision_count = jnp.zeros((env.batch_size,), dtype=jnp.float32)
     episode_length_acc = jnp.zeros((env.batch_size,), dtype=jnp.float32)
     slip_angle_abs_deg_acc = jnp.zeros((env.batch_size,), dtype=jnp.float32)
     slip_reward_acc = jnp.zeros((env.batch_size,), dtype=jnp.float32)
 
     def scan_step(carry, _):
-        state, active, episode_reward, episode_length_acc, slip_angle_abs_deg_acc, slip_reward_acc, current_key = carry
+        (
+            state,
+            active,
+            episode_reward,
+            episode_cost,
+            episode_edge_cost,
+            episode_collision_count,
+            episode_length_acc,
+            slip_angle_abs_deg_acc,
+            slip_reward_acc,
+            current_key,
+        ) = carry
         current_key, key_policy, key_env = jax.random.split(current_key, 3)
         action, _ = policy(state.obs["actor_obs"], key_policy)
         next_state, out = env.step(state, action, key_env)
         episode_reward = episode_reward + out.reward * active
+        episode_cost = episode_cost + env.constraint_cost(out.metrics, out.reward) * active
+        episode_edge_cost = episode_edge_cost + out.metrics.get(
+            "edge_cost", jnp.zeros_like(out.reward)
+        ) * active
+        episode_collision_count = episode_collision_count + out.metrics.get(
+            "collision_cost", jnp.zeros_like(out.reward)
+        ) * active
         episode_length_acc = episode_length_acc + active
         slip_angle_abs_deg_acc = slip_angle_abs_deg_acc + out.metrics["slip_angle_abs_deg"] * active
         slip_reward_acc = slip_reward_acc + out.metrics["slip_reward_raw"] * active
@@ -142,15 +229,40 @@ def _evaluate_policy_episode_batch(
             next_state,
             active,
             episode_reward,
+            episode_cost,
+            episode_edge_cost,
+            episode_collision_count,
             episode_length_acc,
             slip_angle_abs_deg_acc,
             slip_reward_acc,
             current_key,
         ), None
 
-    (_, _, rewards, lengths, slip_angle_abs_deg_acc, slip_reward_acc, _), _ = jax.lax.scan(
+    (
+        _,
+        _,
+        rewards,
+        costs,
+        edge_costs,
+        collision_counts,
+        lengths,
+        slip_angle_abs_deg_acc,
+        slip_reward_acc,
+        _,
+    ), _ = jax.lax.scan(
         scan_step,
-        (state, active, episode_reward, episode_length_acc, slip_angle_abs_deg_acc, slip_reward_acc, key),
+        (
+            state,
+            active,
+            episode_reward,
+            episode_cost,
+            episode_edge_cost,
+            episode_collision_count,
+            episode_length_acc,
+            slip_angle_abs_deg_acc,
+            slip_reward_acc,
+            key,
+        ),
         None,
         length=episode_length,
     )
@@ -159,6 +271,9 @@ def _evaluate_policy_episode_batch(
     slip_reward_per_env = slip_reward_acc / safe_lengths
     return _EvalEpisodeBatch(
         rewards=rewards,
+        costs=costs,
+        edge_costs=edge_costs,
+        collision_counts=collision_counts,
         lengths=lengths,
         slip_angle_abs_deg=slip_angle_abs_deg_per_env,
         slip_reward=slip_reward_per_env,
@@ -172,6 +287,7 @@ def evaluate_policy(
     dynamics_params: jax.Array,
     episode_length: int,
     episodes_per_dynamics: int = 1,
+    safety_bound: float | None = None,
 ) -> EvalResult:
     """Run eval rollouts and aggregate episode returns over selected dynamics."""
     episodes_per_dynamics = int(episodes_per_dynamics)
@@ -195,6 +311,9 @@ def evaluate_policy(
         _, batch = jax.lax.scan(scan_episode, None, keys)
         batch = _EvalEpisodeBatch(
             rewards=jnp.reshape(batch.rewards, (-1,)),
+            costs=jnp.reshape(batch.costs, (-1,)),
+            edge_costs=jnp.reshape(batch.edge_costs, (-1,)),
+            collision_counts=jnp.reshape(batch.collision_counts, (-1,)),
             lengths=jnp.reshape(batch.lengths, (-1,)),
             slip_angle_abs_deg=jnp.reshape(batch.slip_angle_abs_deg, (-1,)),
             slip_reward=jnp.reshape(batch.slip_reward, (-1,)),
@@ -202,11 +321,15 @@ def evaluate_policy(
 
     metrics = _build_eval_metrics(
         batch.rewards,
+        batch.costs,
+        batch.edge_costs,
+        batch.collision_counts,
         batch.lengths,
         batch.slip_angle_abs_deg,
         batch.slip_reward,
         dynamics_count=env.batch_size,
         episodes_per_dynamics=episodes_per_dynamics,
+        safety_bound=safety_bound,
     )
     rewards = batch.rewards
     lengths = batch.lengths
