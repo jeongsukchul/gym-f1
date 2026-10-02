@@ -1060,6 +1060,8 @@ def main() -> None:
     parser.add_argument("--eval-video-max-frames", type=int, default=None, help="Maximum frames per eval trajectory video")
     parser.add_argument("--updates", type=int, default=None, help="Optional override; default derives from total_timesteps")
     parser.add_argument("--onnx-output", default="", help="Optional path to export the deterministic actor as ONNX")
+    parser.add_argument("--deployment-output", type=Path, default=None,
+                        help="Export NumPy actor, track and observation/action contract for legacy ROS1")
     parser.add_argument("--checkpoint-output", type=Path, default=None,
                         help="Save final full JAX training state for reproducibility")
     parser.add_argument("--resume-checkpoint", type=Path, default=None,
@@ -1458,6 +1460,13 @@ def main() -> None:
 
         export_trainer_policy_to_onnx(trainer, state, args.onnx_output)
         print(f"Exported ONNX policy: {args.onnx_output}")
+
+    if args.deployment_output is not None:
+        from gymkhana.jax_sampler_ppo.export_deploy import export_deployment_bundle
+
+        contract = export_deployment_bundle(trainer, state, args.deployment_output)
+        print(f"Exported ROS1 bundle: {args.deployment_output} "
+              f"(actor_obs={contract['actor_observation_size']}, policy_hz={contract['policy_hz']})")
 
     if wandb_started_here:
         try:

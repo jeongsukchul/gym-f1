@@ -1,0 +1,6 @@
+<launch>
+  <arg name="vehicle_config" default="$(find racecar_policy)/config/vehicle.yaml"/>
+  <node pkg="racecar_policy" type="pose_velocity_node.py" name="racecar_pose_velocity" output="screen">
+    <rosparam command="load" file="$(arg vehicle_config)"/>
+  </node>
+</launch>

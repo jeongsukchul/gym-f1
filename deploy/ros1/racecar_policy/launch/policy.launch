@@ -1,0 +1,10 @@
+<launch>
+  <arg name="bundle_dir"/>
+  <arg name="vehicle_config" default="$(find racecar_policy)/config/vehicle.yaml"/>
+  <arg name="dry_run" default="true"/>
+  <node pkg="racecar_policy" type="policy_node.py" name="racecar_policy" output="screen">
+    <rosparam command="load" file="$(arg vehicle_config)"/>
+    <param name="bundle_dir" value="$(arg bundle_dir)"/>
+    <param name="dry_run" value="$(arg dry_run)"/>
+  </node>
+</launch>

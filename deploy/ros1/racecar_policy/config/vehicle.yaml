@@ -1,0 +1,32 @@
+# Conservative initial limits; these do not change the trained actor scaling.
+dry_run: true
+calibration_confirmed: false
+state_estimator_confirmed: false
+speed_min: 0.0
+speed_max: 0.5
+steer_min: -0.20
+steer_max: 0.20
+command_timeout: 0.10
+sensor_timeout: 0.10
+max_sensor_skew: 0.04
+state_topic: /racecar/state_estimate
+imu_topic: /imu/data
+vesc_topic: /vesc/sensors/core
+drive_topic: /vesc/high_level/ackermann_cmd_mux/input/nav_0
+map_frame: map
+base_frame: base_link
+# The state estimate must give CoG position and CoG body-frame velocity.
+state_frame: base_link
+# Mounting transform must be available to tf, including its gyro axis direction.
+erpm_sign: -1.0
+# REQUIRED before inference: electrical pole pairs and motor rotations / wheel rotation.
+motor_pole_pairs: 0
+motor_to_wheel_ratio: 0.0
+# A single motor estimates mean axle speed; explicitly validate this approximation.
+wheel_speed_estimate_confirmed: false
+# Used by pose_velocity_node only: measured base_link -> CoG translation, not wheelbase.
+base_to_cog_x: 0.0
+pose_topic: /amcl_pose
+velocity_filter_time_constant: 0.10
+max_pose_xy_variance: 0.04
+max_pose_yaw_variance: 0.04

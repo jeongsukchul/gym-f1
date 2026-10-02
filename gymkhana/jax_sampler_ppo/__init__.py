@@ -20,6 +20,7 @@ _EXPORTS = {
     "generate_adv_unroll": (".evaluator", "generate_adv_unroll"),
     "record_policy_trajectory": (".evaluator", "record_policy_trajectory"),
     "export_policy_to_onnx": (".export_onnx", "export_policy_to_onnx"),
+    "export_deployment_bundle": (".export_deploy", "export_deployment_bundle"),
     "export_trainer_policy_to_onnx": (".export_onnx", "export_trainer_policy_to_onnx"),
     "validate_export": (".export_onnx", "validate_export"),
     "BoundedGMMVISampler": (".gmmvi_sampler", "BoundedGMMVISampler"),
@@ -54,6 +55,7 @@ if TYPE_CHECKING:
         record_policy_trajectory,
     )
     from .export_onnx import export_policy_to_onnx, export_trainer_policy_to_onnx, validate_export
+    from .export_deploy import export_deployment_bundle
     from .gmmvi_sampler import (
         BoundedGMMVISampler,
         GMMVISamplerState,
